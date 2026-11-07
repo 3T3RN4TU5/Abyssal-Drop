@@ -1079,4 +1079,123 @@ export function computeCompanionDecision(
   };
 }
 
+// ============================================================================
+// 9. DYNAMIC TACTICAL KILLFEED ENGINE
+// ============================================================================
+
+export type KillfeedEventCategory =
+  | 'ELIMINATION'
+  | 'EXTRACTION'
+  | 'TERMINAL'
+  | 'TACTICAL';
+
+export interface KillfeedEntry {
+  id: number;
+  actor: string;
+  verb: string;
+  subject: string;
+  category: KillfeedEventCategory;
+  createdAtSec: number;
+  ttlSec: number;
+}
+
+export interface EvaluatedKillfeedEntry extends KillfeedEntry {
+  opacity: number;
+}
+
+const ARCHETYPE_DISPLAY_NAME: Record<EnemyArchetype, string> = {
+  chaser: 'Chaser unit',
+  kiter: 'Kiter unit',
+  interceptor: 'Interceptor unit',
+  suppressor: 'Suppressor unit',
+};
+
+export function formatEliminationKillfeed(
+  killerCallsign: string,
+  archetype: EnemyArchetype,
+  id: number,
+  nowSec: number,
+  ttlSec = 6.5
+): KillfeedEntry {
+  const cleanCallsign = killerCallsign.startsWith('Operative ')
+    ? killerCallsign
+    : `Operative ${killerCallsign}`;
+  return {
+    id,
+    actor: cleanCallsign,
+    verb: 'eliminated',
+    subject: ARCHETYPE_DISPLAY_NAME[archetype],
+    category: 'ELIMINATION',
+    createdAtSec: nowSec,
+    ttlSec,
+  };
+}
+
+export function formatExtractionMilestoneKillfeed(
+  milestonePct: number,
+  id: number,
+  nowSec: number,
+  ttlSec = 6.5
+): KillfeedEntry {
+  return {
+    id,
+    actor: 'Extraction beacon',
+    verb: 'at',
+    subject: `${Math.round(milestonePct)}%`,
+    category: 'EXTRACTION',
+    createdAtSec: nowSec,
+    ttlSec,
+  };
+}
+
+export function formatTerminalKillfeed(
+  actorCallsign: string,
+  terminalLabel: string,
+  dataYieldGb: number,
+  id: number,
+  nowSec: number,
+  ttlSec = 6.5
+): KillfeedEntry {
+  const cleanCallsign = actorCallsign.startsWith('Operative ')
+    ? actorCallsign
+    : `Operative ${actorCallsign}`;
+  return {
+    id,
+    actor: cleanCallsign,
+    verb: 'decrypted',
+    subject: `${terminalLabel} (+${dataYieldGb} GB)`,
+    category: 'TERMINAL',
+    createdAtSec: nowSec,
+    ttlSec,
+  };
+}
+
+export function pruneAndFadeKillfeed(
+  entries: KillfeedEntry[],
+  nowSec: number,
+  maxVisible = 4
+): Array<KillfeedEntry & { opacity: number }> {
+  const active: Array<KillfeedEntry & { opacity: number }> = [];
+
+  for (const entry of entries) {
+    const age = Math.max(0, nowSec - entry.createdAtSec);
+    if (age >= entry.ttlSec) continue;
+
+    // Quick 0.2s fade-in, hold full opacity, then smooth 1.4s fade-out at end of TTL
+    let opacity = 1.0;
+    if (age < 0.2) {
+      opacity = Math.max(0.15, age / 0.2);
+    } else if (age > entry.ttlSec - 1.4) {
+      opacity = Math.max(0, (entry.ttlSec - age) / 1.4);
+    }
+    active.push({
+      ...entry,
+      opacity: Number(opacity.toFixed(2)),
+    });
+  }
+
+  return active.slice(-maxVisible);
+}
+
+
 

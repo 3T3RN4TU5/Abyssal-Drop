@@ -21,13 +21,19 @@ import {
   DROP_ZONES,
   DropZoneOption,
   EnemyArchetype,
+  EvaluatedKillfeedEntry,
+  formatEliminationKillfeed,
+  formatExtractionMilestoneKillfeed,
+  formatTerminalKillfeed,
   GamePhase,
   getCompanionClasses,
   HeatmapPoint,
   isOutsideSafeCircle,
+  KillfeedEntry,
   MissionModifier,
   OPERATIVE_CLASSES,
   OperativeClassId,
+  pruneAndFadeKillfeed,
   RoleMode,
   rollMissionModifiers,
   SQUAD_ORDERS,
@@ -55,6 +61,7 @@ import { InkSplatEvent, InkThreatOverlay } from './components/InkThreatOverlay';
 import { AnalystOverlay } from './components/AnalystOverlay';
 import { SkillTreeModal } from './components/SkillTreeModal';
 import { StudioPipelineModal } from './components/StudioPipelineModal';
+import { KillfeedOverlay } from './components/KillfeedOverlay';
 
 const HdrpInkGradeShader = {
   uniforms: {
@@ -140,6 +147,7 @@ interface EmpTrapRuntime {
 interface BulletRuntime {
   active: boolean;
   fromEnemy: boolean;
+  shooterCallsign: string;
   x: number;
   y: number;
   z: number;
@@ -221,6 +229,15 @@ export default function App() {
     'Match Modifiers & Drop Telemetry Synced'
   );
   const [inkSplats, setInkSplats] = useState<InkSplatEvent[]>([]);
+  const [killfeedEntries, setKillfeedEntries] = useState<EvaluatedKillfeedEntry[]>(() =>
+    pruneAndFadeKillfeed(
+      [
+        formatEliminationKillfeed('WRAITH-2', 'interceptor', 1, 0, 10.0),
+        formatExtractionMilestoneKillfeed(50, 2, 0, 10.0),
+      ],
+      0.25
+    )
+  );
   const [waypoint, setWaypoint] = useState<{ x: number; z: number } | null>({
     x: -22,
     z: 10,
@@ -354,8 +371,14 @@ export default function App() {
     kills: 0,
     matchTimeSec: 0,
     extractionProgress: 0,
+    lastExtractionMilestone: 0,
     splatCounter: 1,
     splats: [] as InkSplatEvent[],
+    killfeedCounter: 3,
+    killfeed: [
+      formatEliminationKillfeed('WRAITH-2', 'interceptor', 1, 0, 18.0),
+      formatExtractionMilestoneKillfeed(50, 2, 0, 20.0),
+    ] as KillfeedEntry[],
     resetRequested: false,
     reconPulseRequested: false,
     empTrapRequested: false,
@@ -943,6 +966,7 @@ export default function App() {
     const bullets: BulletRuntime[] = Array.from({ length: maxBullets }, () => ({
       active: false,
       fromEnemy: false,
+      shooterCallsign: 'KESTREL-1',
       x: 0,
       y: -100,
       z: 0,
@@ -1001,13 +1025,15 @@ export default function App() {
       dirX: number,
       dirZ: number,
       fromEnemy: boolean,
-      damage: number
+      damage: number,
+      shooterCallsign = 'KESTREL-1'
     ) => {
       const slot = bullets.find((b) => !b.active);
       if (!slot) return;
       const spd = fromEnemy ? 24 : 38;
       slot.active = true;
       slot.fromEnemy = fromEnemy;
+      slot.shooterCallsign = shooterCallsign;
       slot.x = x;
       slot.y = 1.3;
       slot.z = z;
@@ -1015,6 +1041,13 @@ export default function App() {
       slot.vz = dirZ * spd;
       slot.damage = damage;
       slot.life = 1.6;
+    };
+
+    const pushKillfeed = (entry: KillfeedEntry) => {
+      simRef.current.killfeed.push(entry);
+      if (simRef.current.killfeed.length > 12) {
+        simRef.current.killfeed.shift();
+      }
     };
 
     const pushInkSplat = (
@@ -1234,6 +1267,22 @@ export default function App() {
           tr.cooldown = 0;
         });
         s.splats = [];
+        s.lastExtractionMilestone = 0;
+        s.killfeed = [
+          formatEliminationKillfeed(
+            'WRAITH-2',
+            'interceptor',
+            s.killfeedCounter++,
+            s.matchTimeSec,
+            16.0
+          ),
+          formatExtractionMilestoneKillfeed(
+            50,
+            s.killfeedCounter++,
+            s.matchTimeSec,
+            18.0
+          ),
+        ];
       }
 
       // Handle Operative Class Mesh Swap (swaps Lead + rebuilds Companion Class Rigs)
@@ -1353,6 +1402,7 @@ export default function App() {
         if (s.classAbilityRequested && p.abilityCooldown <= 0) {
           s.classAbilityRequested = false;
           const spec = CLASS_ABILITIES[s.activeOperative];
+          const leadCallsign = OPERATIVE_CLASSES[s.activeOperative].callsign;
           p.abilityCooldown = spec.cooldownSec;
           if (s.activeOperative === 'vanguard') {
             for (let k = -2; k <= 2; k++) {
@@ -1363,7 +1413,8 @@ export default function App() {
                 -Math.sin(ang),
                 -Math.cos(ang),
                 false,
-                Math.round(s.effectiveStats.weaponDamage * 1.35)
+                Math.round(s.effectiveStats.weaponDamage * 1.35),
+                leadCallsign
               );
             }
             sound.playShoot(0.8);
@@ -1378,6 +1429,18 @@ export default function App() {
               if (e.hp > 0 && Math.hypot(e.x - p.x, e.z - p.z) < 11) {
                 e.hp -= 35;
                 e.hitFlashTimer = 0.2;
+                if (e.hp <= 0 && e.koTimer <= 0) {
+                  e.koTimer = 0.45;
+                  s.kills++;
+                  pushKillfeed(
+                    formatEliminationKillfeed(
+                      leadCallsign,
+                      e.archetype,
+                      s.killfeedCounter++,
+                      s.matchTimeSec
+                    )
+                  );
+                }
               }
             });
             sound.playHackComplete();
@@ -1409,6 +1472,14 @@ export default function App() {
                 if (e.hp <= 0 && e.koTimer <= 0) {
                   e.koTimer = 0.45;
                   s.kills++;
+                  pushKillfeed(
+                    formatEliminationKillfeed(
+                      'ANALYST EMP',
+                      e.archetype,
+                      s.killfeedCounter++,
+                      s.matchTimeSec
+                    )
+                  );
                   awardXpAndCheckLevel(45, 'EMP Elimination');
                 }
               }
@@ -1565,7 +1636,8 @@ export default function App() {
               fireDirX,
               fireDirZ,
               false,
-              compDmg
+              compDmg,
+              sq.callsign
             );
           }
 
@@ -1592,7 +1664,25 @@ export default function App() {
                 }));
                 const hackedNow = terminals.filter((t) => t.hacked).length;
                 setTerminalsHacked(hackedNow);
-                if (hackedNow >= 2) setExtractionReady(true);
+                pushKillfeed(
+                  formatTerminalKillfeed(
+                    sq.callsign,
+                    compTerm.label,
+                    totalDataEarned,
+                    s.killfeedCounter++,
+                    s.matchTimeSec
+                  )
+                );
+                if (hackedNow === 1) {
+                  pushKillfeed(
+                    formatExtractionMilestoneKillfeed(50, s.killfeedCounter++, s.matchTimeSec)
+                  );
+                } else if (hackedNow >= 2) {
+                  setExtractionReady(true);
+                  pushKillfeed(
+                    formatExtractionMilestoneKillfeed(100, s.killfeedCounter++, s.matchTimeSec)
+                  );
+                }
                 sound.playHackComplete();
                 awardXpAndCheckLevel(65, `${sq.callsign} Breached ${compTerm.label}`);
                 setStatusBanner(
@@ -1680,7 +1770,8 @@ export default function App() {
               dirX,
               dirZ,
               false,
-              s.effectiveStats.weaponDamage
+              s.effectiveStats.weaponDamage,
+              OPERATIVE_CLASSES[s.activeOperative].callsign
             );
             sound.playShoot();
             if (p.ammo === 0) {
@@ -1730,8 +1821,24 @@ export default function App() {
                 }));
                 const hackedNow = terminals.filter((t) => t.hacked).length;
                 setTerminalsHacked(hackedNow);
-                if (hackedNow >= 2) {
+                pushKillfeed(
+                  formatTerminalKillfeed(
+                    OPERATIVE_CLASSES[s.activeOperative].callsign,
+                    term.label,
+                    totalDataEarned,
+                    s.killfeedCounter++,
+                    s.matchTimeSec
+                  )
+                );
+                if (hackedNow === 1) {
+                  pushKillfeed(
+                    formatExtractionMilestoneKillfeed(50, s.killfeedCounter++, s.matchTimeSec)
+                  );
+                } else if (hackedNow >= 2) {
                   setExtractionReady(true);
+                  pushKillfeed(
+                    formatExtractionMilestoneKillfeed(100, s.killfeedCounter++, s.matchTimeSec)
+                  );
                 }
                 pushInkSplat(term.x, term.z, 0.9, 'breach');
                 sound.playHackComplete();
@@ -1941,6 +2048,14 @@ export default function App() {
                 if (e.hp <= 0 && e.koTimer <= 0) {
                   e.koTimer = 0.45;
                   s.kills++;
+                  pushKillfeed(
+                    formatEliminationKillfeed(
+                      b.shooterCallsign || OPERATIVE_CLASSES[s.activeOperative].callsign,
+                      e.archetype,
+                      s.killfeedCounter++,
+                      s.matchTimeSec
+                    )
+                  );
                   setDataCurrency((d) => d + 15);
                   awardXpAndCheckLevel(40, `Eliminated ${e.archetype.toUpperCase()}`);
                 }
@@ -1961,6 +2076,19 @@ export default function App() {
         const distToExtract = Math.hypot(p.x - 0, p.z - -34);
         if ((hackedCount >= 2 || s.dataCurrency >= 90) && distToExtract < 6.2) {
           s.extractionProgress = Math.min(1, s.extractionProgress + simDt / 3.0);
+          const pctNow = Math.floor(s.extractionProgress * 100);
+          for (const mile of [25, 50, 75, 100]) {
+            if (pctNow >= mile && s.lastExtractionMilestone < mile) {
+              s.lastExtractionMilestone = mile;
+              pushKillfeed(
+                formatExtractionMilestoneKillfeed(
+                  mile,
+                  s.killfeedCounter++,
+                  s.matchTimeSec
+                )
+              );
+            }
+          }
           if (s.extractionProgress >= 1) {
             sound.playHackComplete();
             setMatchResult('victory');
@@ -2017,6 +2145,7 @@ export default function App() {
           );
           setExtractionProgress(Math.round(s.extractionProgress * 100));
           setInkSplats([...s.splats]);
+          setKillfeedEntries(pruneAndFadeKillfeed(s.killfeed, s.matchTimeSec, 4));
           setCompanionTelemetry(
             s.squadMates.map((sq) => ({
               callsign: sq.callsign,
@@ -2359,63 +2488,69 @@ export default function App() {
               <div />
             )}
 
-            {/* Top-Right Cluster: Role Switch, Skill Tree, Class Switch, & Utility Buttons */}
-            <div className="flex flex-wrap items-center justify-end gap-2 pointer-events-auto">
-              <button
-                type="button"
-                onClick={() => {
-                  setRoleMode((prev) => (prev === 'operative' ? 'analyst' : 'operative'));
-                  sound.playAnalystPulse();
-                }}
-                className="px-3.5 py-2 rounded-lg ink-panel-accent text-xs font-semibold text-cyan-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
-              >
-                [Tab] {roleMode === 'operative' ? 'Switch to Sky Analyst' : 'Switch to 3D Operative'}
-              </button>
+            {/* Top-Right Cluster: Utility Buttons + Dynamic Gritty Monochrome Killfeed */}
+            <div className="flex flex-col items-end gap-2.5">
+              <div className="flex flex-wrap items-center justify-end gap-2 pointer-events-auto">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRoleMode((prev) => (prev === 'operative' ? 'analyst' : 'operative'));
+                    sound.playAnalystPulse();
+                  }}
+                  className="px-3.5 py-2 rounded-lg ink-panel-accent text-xs font-semibold text-cyan-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  [Tab] {roleMode === 'operative' ? 'Switch to Sky Analyst' : 'Switch to 3D Operative'}
+                </button>
 
-              <button
-                type="button"
-                onClick={() => setIsSkillTreeOpen(true)}
-                className="px-3.5 py-2 rounded-lg ink-panel text-xs font-semibold text-amber-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
-              >
-                [K] Skill Tree ({skillPoints} SP)
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setIsSkillTreeOpen(true)}
+                  className="px-3.5 py-2 rounded-lg ink-panel text-xs font-semibold text-amber-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  [K] Skill Tree ({skillPoints} SP)
+                </button>
 
-              <button
-                type="button"
-                onClick={() => setHdrpMode((prev) => !prev)}
-                className={`px-3 py-2 rounded-lg text-xs font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                  hdrpMode
-                    ? 'ink-panel-accent text-emerald-300'
-                    : 'ink-panel text-slate-400 hover:text-white'
-                }`}
-              >
-                HDRP {hdrpMode ? 'ULTRA [H]' : 'RAW [H]'}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setHdrpMode((prev) => !prev)}
+                  className={`px-3 py-2 rounded-lg text-xs font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                    hdrpMode
+                      ? 'ink-panel-accent text-emerald-300'
+                      : 'ink-panel text-slate-400 hover:text-white'
+                  }`}
+                >
+                  HDRP {hdrpMode ? 'ULTRA [H]' : 'RAW [H]'}
+                </button>
 
-              <button
-                type="button"
-                aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  sound.muted = !muted;
-                  setMuted(!muted);
-                }}
-                className="px-3 py-2 rounded-lg ink-panel text-xs font-mono-tabular text-slate-200 hover:text-white cursor-pointer"
-              >
-                {muted ? 'Unmute [M]' : 'Mute [M]'}
-              </button>
+                <button
+                  type="button"
+                  aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    sound.muted = !muted;
+                    setMuted(!muted);
+                  }}
+                  className="px-3 py-2 rounded-lg ink-panel text-xs font-mono-tabular text-slate-200 hover:text-white cursor-pointer"
+                >
+                  {muted ? 'Unmute [M]' : 'Mute [M]'}
+                </button>
 
-              <button
-                type="button"
-                aria-label="Pause Game"
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  setGamePhase('paused');
-                }}
-                className="px-3 py-2 rounded-lg ink-panel text-xs font-mono-tabular text-slate-200 hover:text-white cursor-pointer"
-              >
-                Pause [P]
-              </button>
+                <button
+                  type="button"
+                  aria-label="Pause Game"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    setGamePhase('paused');
+                  }}
+                  className="px-3 py-2 rounded-lg ink-panel text-xs font-mono-tabular text-slate-200 hover:text-white cursor-pointer"
+                >
+                  Pause [P]
+                </button>
+              </div>
+
+              {roleMode === 'operative' && (
+                <KillfeedOverlay entries={killfeedEntries} />
+              )}
             </div>
           </div>
 

@@ -14,6 +14,9 @@ import {
   isOutsideSafeCircle,
   computeCompanionDecision,
   getCompanionClasses,
+  formatEliminationKillfeed,
+  formatExtractionMilestoneKillfeed,
+  pruneAndFadeKillfeed,
   UnlockedSkillsMap,
   WeatherState,
 } from './rules';
@@ -188,5 +191,30 @@ test('computeCompanionDecision engages nearby hostiles and executes BREACH_TERMI
   assert.equal(breachDecision.hackingTerminalId, 'T1');
   assert.equal(breachDecision.actionTag, 'DECRYPTING T1');
 });
+
+test('Killfeed engine formats combat eliminations, extraction milestones, and fades expired entries', () => {
+  const elim = formatEliminationKillfeed('WRAITH-2', 'interceptor', 1, 10.0, 6.0);
+  assert.equal(
+    `${elim.actor} ${elim.verb} ${elim.subject}`,
+    'Operative WRAITH-2 eliminated Interceptor unit'
+  );
+
+  const ext = formatExtractionMilestoneKillfeed(50, 2, 12.0, 6.0);
+  assert.equal(
+    `${ext.actor} ${ext.verb} ${ext.subject}`,
+    'Extraction beacon at 50%'
+  );
+
+  // At t=13.0, both entries are active; at t=17.5, elim (created at 10.0, ttl 6.0) is pruned
+  const activeAt13 = pruneAndFadeKillfeed([elim, ext], 13.0, 4);
+  assert.equal(activeAt13.length, 2);
+  assert.equal(activeAt13[0].opacity, 1);
+
+  const activeAt175 = pruneAndFadeKillfeed([elim, ext], 17.5, 4);
+  assert.equal(activeAt175.length, 1);
+  assert.equal(activeAt175[0].id, 2);
+  assert.ok(activeAt175[0].opacity < 1 && activeAt175[0].opacity > 0);
+});
+
 
 
