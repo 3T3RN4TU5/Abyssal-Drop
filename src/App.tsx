@@ -1,17 +1,28 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import {
+  ALL_MISSION_MODIFIERS,
+  advanceCircleClosure,
   allocateSkillPoint,
   advanceWeatherSystem,
+  CircleClosureState,
+  CLASS_ABILITIES,
   computeEffectiveStats,
   computeEffectiveWeatherMetrics,
   computeProbabilityHeatmap,
+  createInitialCircleState,
   DROP_ZONES,
   DropZoneOption,
   EnemyArchetype,
   GamePhase,
   HeatmapPoint,
+  isOutsideSafeCircle,
   MissionModifier,
   OPERATIVE_CLASSES,
   OperativeClassId,
@@ -22,17 +33,65 @@ import {
   WeatherState,
 } from './game/rules';
 import {
+  createAtmosphericSkyDome,
   createBasinGridTexture,
+  createBasinNormalTexture,
+  createBasinRoughnessTexture,
   createBumpTexture,
   createDataTerminalMesh,
   createEnemyAgentMesh,
   createExtractionSpireMesh,
   createOperativeMesh,
+  createTacticalBunkerMesh,
 } from './game/sceneBuilder';
 import { sound } from './game/sound';
 import { InkSplatEvent, InkThreatOverlay } from './components/InkThreatOverlay';
 import { AnalystOverlay } from './components/AnalystOverlay';
 import { SkillTreeModal } from './components/SkillTreeModal';
+import { StudioPipelineModal } from './components/StudioPipelineModal';
+
+const HdrpInkGradeShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uChromatic: { value: 0.0016 },
+    uVignette: { value: 0.38 },
+    uContrast: { value: 1.09 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float uChromatic;
+    uniform float uVignette;
+    uniform float uContrast;
+    varying vec2 vUv;
+
+    void main() {
+      vec2 centered = vUv - 0.5;
+      float dist = length(centered);
+      vec2 offset = centered * uChromatic * (dist * 1.8);
+
+      float r = texture2D(tDiffuse, vUv + offset).r;
+      float g = texture2D(tDiffuse, vUv).g;
+      float b = texture2D(tDiffuse, vUv - offset).b;
+      vec3 col = vec3(r, g, b);
+
+      // Filmic micro-contrast S-curve
+      col = clamp((col - 0.5) * uContrast + 0.5, 0.0, 1.0);
+
+      // Sumi-e dark ink peripheral vignette
+      float vig = smoothstep(0.82, 0.28, dist * (1.0 + uVignette));
+      col *= mix(0.52, 1.0, vig);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+};
 
 interface EnemyRuntime {
   id: string;
@@ -116,6 +175,11 @@ export default function App() {
   const [operativeLevel, setOperativeLevel] = useState<number>(2);
   const [operativeXp, setOperativeXp] = useState<number>(140);
   const [isSkillTreeOpen, setIsSkillTreeOpen] = useState<boolean>(false);
+  const [isStudioModalOpen, setIsStudioModalOpen] = useState<boolean>(false);
+  const [hdrpMode, setHdrpMode] = useState<boolean>(true);
+  const [circleState, setCircleState] = useState<CircleClosureState>(() =>
+    createInitialCircleState()
+  );
 
   // Live HUD State (throttled updates from 60Hz loop)
   const [hp, setHp] = useState<number>(110);
@@ -124,6 +188,7 @@ export default function App() {
   const [maxAmmo, setMaxAmmo] = useState<number>(28);
   const [reloadingTimer, setReloadingTimer] = useState<number>(0);
   const [dashCooldown, setDashCooldown] = useState<number>(0);
+  const [abilityCooldown, setAbilityCooldown] = useState<number>(0);
   const [dataCurrency, setDataCurrency] = useState<number>(45);
   const [terminalsHacked, setTerminalsHacked] = useState<number>(0);
   const [totalTerminals] = useState<number>(4);
@@ -215,6 +280,9 @@ export default function App() {
     weather,
     activeModifiers,
     isSkillTreeOpen,
+    isStudioModalOpen,
+    hdrpMode,
+    circle: createInitialCircleState(),
     waypoint,
     dataCurrency,
     skillPoints,
@@ -233,6 +301,8 @@ export default function App() {
       reloadTimer: 0,
       dashCooldown: 0,
       dashActiveTimer: 0,
+      abilityCooldown: 0,
+      stealthOverdriveTimer: 0,
       shootCooldown: 0,
       hitstopTimer: 0,
       cameraTrauma: 0,
@@ -252,6 +322,7 @@ export default function App() {
     reconPulseRequested: false,
     empTrapRequested: false,
     supplyDropRequested: false,
+    classAbilityRequested: false,
     switchOperativeMeshRequested: false,
   });
 
@@ -264,6 +335,8 @@ export default function App() {
     simRef.current.weather = weather;
     simRef.current.activeModifiers = activeModifiers;
     simRef.current.isSkillTreeOpen = isSkillTreeOpen;
+    simRef.current.isStudioModalOpen = isStudioModalOpen;
+    simRef.current.hdrpMode = hdrpMode;
     simRef.current.waypoint = waypoint;
     simRef.current.dataCurrency = dataCurrency;
     simRef.current.skillPoints = skillPoints;
@@ -278,6 +351,8 @@ export default function App() {
     weather,
     activeModifiers,
     isSkillTreeOpen,
+    isStudioModalOpen,
+    hdrpMode,
     waypoint,
     dataCurrency,
     skillPoints,
@@ -504,12 +579,12 @@ export default function App() {
     );
     camera.position.set(0, 14, 42);
 
-    // 3-Point Warm/Cool Lighting Rig
-    const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 0.85);
+    // 3-Point Warm/Cool Lighting Rig + Dynamic Local Point Lights
+    const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x090d16, 0.95);
     hemiLight.position.set(0, 50, 0);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xffedd5, 2.2);
+    const keyLight = new THREE.DirectionalLight(0xffedd5, 2.4);
     keyLight.position.set(28, 46, 24);
     keyLight.castShadow = !isSoftwareGl;
     keyLight.shadow.mapSize.width = 1024;
@@ -525,23 +600,46 @@ export default function App() {
     keyLight.shadow.normalBias = 0.02;
     scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x06b6d4, 0.9);
+    const rimLight = new THREE.DirectionalLight(0x06b6d4, 1.15);
     rimLight.position.set(-32, 24, -36);
     scene.add(rimLight);
 
-    // Ground Basin Floor with Procedural Grid & Bump Map
+    // Local Point Lights for Specular Wet Puddle Reflections
+    const spireLight = new THREE.PointLight(0x10b981, 5.0, 32, 1.4);
+    spireLight.position.set(0, 7.5, -34);
+    scene.add(spireLight);
+
+    const centralTermLight = new THREE.PointLight(0x06b6d4, 3.8, 24, 1.5);
+    centralTermLight.position.set(0, 4.2, -6);
+    scene.add(centralTermLight);
+
+    const muzzlePointLight = new THREE.PointLight(0xf59e0b, 0, 15, 1.6);
+    muzzlePointLight.position.set(0, 1.6, 28);
+    scene.add(muzzlePointLight);
+
+    // Atmospheric HDRP Sky Dome
+    const skyDome = createAtmosphericSkyDome();
+    scene.add(skyDome);
+
+    // Ground Basin Floor with PBR Albedo, Specular Wet Puddle Roughness & Tangent-Space Normal Map
     const maxAniso = renderer.capabilities.getMaxAnisotropy();
     const gridTex = createBasinGridTexture(maxAniso);
+    const roughTex = createBasinRoughnessTexture();
+    const normalTex = createBasinNormalTexture();
     const bumpTex = createBumpTexture();
     const groundGeo = new THREE.PlaneGeometry(220, 220);
     groundGeo.rotateX(-Math.PI / 2);
     const groundMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: gridTex,
+      roughnessMap: roughTex,
+      normalMap: normalTex,
+      normalScale: new THREE.Vector2(0.55, 0.55),
       bumpMap: bumpTex,
-      bumpScale: 0.15,
-      roughness: 0.55,
-      metalness: 0.22,
+      bumpScale: 0.12,
+      roughness: 0.78,
+      metalness: 0.32,
+      envMapIntensity: 1.35,
     });
     const ground = new THREE.Mesh(groundGeo, groundMat);
     ground.receiveShadow = true;
@@ -552,8 +650,8 @@ export default function App() {
     const cliffGeo = new THREE.DodecahedronGeometry(4.5, 1);
     const cliffMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
-      roughness: 0.82,
-      metalness: 0.18,
+      roughness: 0.72,
+      metalness: 0.28,
     });
     const cliffInstanced = new THREE.InstancedMesh(cliffGeo, cliffMat, cliffCount);
     const dummy = new THREE.Object3D();
@@ -579,7 +677,7 @@ export default function App() {
     cliffInstanced.computeBoundingSphere();
     scene.add(cliffInstanced);
 
-    // Tactical Basalt Cover Structures across the basin
+    // Composite Armored Tactical Barricades across the basin
     const coverObstacles: Array<{ x: number; z: number; rx: number; rz: number }> = [
       { x: -14, z: 12, rx: 3.2, rz: 1.4 },
       { x: 14, z: 12, rx: 3.2, rz: 1.4 },
@@ -589,37 +687,9 @@ export default function App() {
       { x: -10, z: -20, rx: 3.4, rz: 1.3 },
       { x: 10, z: -20, rx: 3.4, rz: 1.3 },
     ];
-    const coverWallMat = new THREE.MeshStandardMaterial({
-      color: 0x1e293b,
-      roughness: 0.6,
-      metalness: 0.45,
-    });
-    const coverTrimMat = new THREE.MeshStandardMaterial({
-      color: 0x06b6d4,
-      emissive: 0x06b6d4,
-      emissiveIntensity: 0.5,
-      roughness: 0.25,
-      metalness: 0.8,
-    });
 
     coverObstacles.forEach((cov) => {
-      const covGroup = new THREE.Group();
-      const baseWall = new THREE.Mesh(
-        new THREE.BoxGeometry(cov.rx * 2, 2.3, cov.rz * 2),
-        coverWallMat
-      );
-      baseWall.position.y = 1.15;
-      baseWall.castShadow = true;
-      baseWall.receiveShadow = true;
-      covGroup.add(baseWall);
-
-      const topCap = new THREE.Mesh(
-        new THREE.BoxGeometry(cov.rx * 2 + 0.15, 0.22, cov.rz * 2 + 0.15),
-        coverTrimMat
-      );
-      topCap.position.y = 2.35;
-      covGroup.add(topCap);
-
+      const covGroup = createTacticalBunkerMesh(cov.rx * 2, 2.35, cov.rz * 2);
       covGroup.position.set(cov.x, 0, cov.z);
       scene.add(covGroup);
     });
@@ -628,6 +698,29 @@ export default function App() {
     const extractionSpire = createExtractionSpireMesh();
     extractionSpire.position.set(0, 0, -34);
     scene.add(extractionSpire);
+
+    // Unity HDRP-Inspired Post-Processing Pipeline (EffectComposer + Selective UnrealBloomPass + Noir Ink Shader + OutputPass)
+    const composer = new EffectComposer(renderer);
+    const renderPass = new RenderPass(scene, camera);
+    composer.addPass(renderPass);
+
+    const bloomScale = isSoftwareGl ? 0.5 : 1.0;
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(
+        Math.max(1, Math.floor(window.innerWidth * bloomScale)),
+        Math.max(1, Math.floor(window.innerHeight * bloomScale))
+      ),
+      0.46, // strength
+      0.32, // radius
+      0.78  // threshold: only high-emissive visors, cores, laser sights & beacons bloom
+    );
+    composer.addPass(bloomPass);
+
+    const inkGradePass = new ShaderPass(HdrpInkGradeShader);
+    composer.addPass(inkGradePass);
+
+    const outputPass = new OutputPass();
+    composer.addPass(outputPass);
 
     // 4 Encrypted Data Terminals
     const terminalCoords = [
@@ -705,6 +798,20 @@ export default function App() {
     wpPillar.position.y = 4.5;
     wpGroup.add(wpPillar);
     scene.add(wpGroup);
+
+    // 3D Abyssal Circle Closure Perimeter Ring
+    const stormRingGeo = new THREE.RingGeometry(0.985, 1.0, 64);
+    stormRingGeo.rotateX(-Math.PI / 2);
+    const stormRingMat = new THREE.MeshBasicMaterial({
+      color: 0xa855f7,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.65,
+    });
+    const stormRingMesh = new THREE.Mesh(stormRingGeo, stormRingMat);
+    stormRingMesh.position.set(0, 0.08, -4);
+    stormRingMesh.scale.setScalar(50);
+    scene.add(stormRingMesh);
 
     // Lead Player Operative Mesh + 2 AI Squad Mates
     let playerMesh = createOperativeMesh(simRef.current.activeOperative, false);
@@ -869,22 +976,42 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       keysPressed.add(e.code);
 
-      if (simRef.current.gamePhase === 'title') {
-        if ((e.code === 'Enter' || e.code === 'Space') && !simRef.current.isSkillTreeOpen) {
-          e.preventDefault();
-          handleStartMatch();
-        }
-        return;
-      }
-
       if (e.code === 'KeyK') {
         e.preventDefault();
         setIsSkillTreeOpen((prev) => !prev);
         return;
       }
 
+      if (e.code === 'KeyG') {
+        e.preventDefault();
+        setIsStudioModalOpen((prev) => !prev);
+        return;
+      }
+
+      if (e.code === 'KeyH') {
+        e.preventDefault();
+        setHdrpMode((prev) => !prev);
+        return;
+      }
+
+      if (simRef.current.gamePhase === 'title') {
+        if (
+          (e.code === 'Enter' || e.code === 'Space') &&
+          !simRef.current.isSkillTreeOpen &&
+          !simRef.current.isStudioModalOpen
+        ) {
+          e.preventDefault();
+          handleStartMatch();
+        }
+        return;
+      }
+
       if (e.code === 'Escape' || e.code === 'KeyP') {
         e.preventDefault();
+        if (simRef.current.isStudioModalOpen) {
+          setIsStudioModalOpen(false);
+          return;
+        }
         if (simRef.current.isSkillTreeOpen) {
           setIsSkillTreeOpen(false);
           return;
@@ -893,12 +1020,19 @@ export default function App() {
         return;
       }
 
-      if (simRef.current.gamePhase !== 'playing' || simRef.current.isSkillTreeOpen) return;
+      if (
+        simRef.current.gamePhase !== 'playing' ||
+        simRef.current.isSkillTreeOpen ||
+        simRef.current.isStudioModalOpen
+      )
+        return;
 
       if (e.code === 'Tab') {
         e.preventDefault();
         setRoleMode((prev) => (prev === 'operative' ? 'analyst' : 'operative'));
         sound.playAnalystPulse();
+      } else if (e.code === 'KeyQ' && simRef.current.roleMode === 'operative') {
+        simRef.current.classAbilityRequested = true;
       } else if (e.code === 'KeyW' && simRef.current.roleMode === 'analyst') {
         handleToggleWeatherFilter();
       } else if (e.code === 'Digit1' && simRef.current.roleMode === 'analyst') {
@@ -949,6 +1083,7 @@ export default function App() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
     };
 
     window.addEventListener('keydown', onKeyDown);
@@ -1093,8 +1228,20 @@ export default function App() {
         const angle = now * 0.00025;
         camera.position.set(Math.sin(angle) * 44, 20, Math.cos(angle) * 44);
         camera.lookAt(0, 2, -6);
-      } else if (s.gamePhase === 'playing' && !s.isSkillTreeOpen) {
+      } else if (
+        s.gamePhase === 'playing' &&
+        !s.isSkillTreeOpen &&
+        !s.isStudioModalOpen
+      ) {
         s.matchTimeSec += dt;
+
+        // Advance Abyssal Circle Closure
+        s.circle = advanceCircleClosure(s.circle, dt);
+        stormRingMesh.position.set(s.circle.centerX, 0.08, s.circle.centerZ);
+        stormRingMesh.scale.setScalar(s.circle.currentRadius);
+        if (isOutsideSafeCircle(p.x, p.z, s.circle)) {
+          p.hp = Math.max(1, p.hp - s.circle.damagePerSecOutside * dt * 0.25);
+        }
 
         // Advance Dynamic Weather Timer every second
         weatherSyncAccum += dt;
@@ -1113,6 +1260,46 @@ export default function App() {
             }
             return nextW;
           });
+        }
+
+        // Handle Operative [Q] Class Ability
+        p.abilityCooldown = Math.max(0, p.abilityCooldown - dt);
+        p.stealthOverdriveTimer = Math.max(0, p.stealthOverdriveTimer - dt);
+        if (s.classAbilityRequested && p.abilityCooldown <= 0) {
+          s.classAbilityRequested = false;
+          const spec = CLASS_ABILITIES[s.activeOperative];
+          p.abilityCooldown = spec.cooldownSec;
+          if (s.activeOperative === 'vanguard') {
+            for (let k = -2; k <= 2; k++) {
+              const ang = p.yaw + k * 0.14;
+              spawnBullet(
+                p.x - Math.sin(ang) * 1.1,
+                p.z - Math.cos(ang) * 1.1,
+                -Math.sin(ang),
+                -Math.cos(ang),
+                false,
+                Math.round(s.effectiveStats.weaponDamage * 1.35)
+              );
+            }
+            sound.playShoot(0.8);
+            setStatusBanner('KESTREL-1 Activated Frag Fan Barrage [Q]!');
+          } else if (s.activeOperative === 'specter') {
+            p.stealthOverdriveTimer = 5.0;
+            sound.playDash();
+            setStatusBanner('WRAITH-2 Activated Thermoptic Overdrive [Q] (5s Stealth & Speed)!');
+          } else {
+            p.hp = Math.min(p.maxHp, p.hp + 40);
+            enemies.forEach((e) => {
+              if (e.hp > 0 && Math.hypot(e.x - p.x, e.z - p.z) < 11) {
+                e.hp -= 35;
+                e.hitFlashTimer = 0.2;
+              }
+            });
+            sound.playHackComplete();
+            setStatusBanner('AEGIS-3 Activated Bastion Nano-Pulse [Q] (+40 HP & Arc Shockwave)!');
+          }
+        } else {
+          s.classAbilityRequested = false;
         }
 
         // Handle Analyst Sky Command Triggers
@@ -1243,8 +1430,14 @@ export default function App() {
         const muzzleObj = playerMesh.getObjectByName('muzzleFlash') as THREE.Mesh | undefined;
         if (muzzleObj) {
           (muzzleObj.material as THREE.MeshBasicMaterial).opacity =
-            p.muzzleTimer > 0 ? 0.9 : 0.0;
+            p.muzzleTimer > 0 ? 0.92 : 0.0;
         }
+        muzzlePointLight.position.set(
+          p.x - Math.sin(p.yaw) * 1.15,
+          1.45,
+          p.z - Math.cos(p.yaw) * 1.15
+        );
+        muzzlePointLight.intensity = p.muzzleTimer > 0 ? 6.5 : 0;
 
         const wantsFire =
           (mouseDown || keysPressed.has('Space') || keysPressed.has('KeyF')) &&
@@ -1585,6 +1778,8 @@ export default function App() {
           setAmmo(p.ammo);
           setReloadingTimer(Number(p.reloadTimer.toFixed(1)));
           setDashCooldown(Number(p.dashCooldown.toFixed(1)));
+          setAbilityCooldown(Number(p.abilityCooldown.toFixed(1)));
+          setCircleState({ ...s.circle });
           setNearTerminalLabel(activeNearTerm ? activeNearTerm.label : null);
           setNearTerminalProgress(
             activeNearTerm ? Math.round(activeNearTerm.progress * 100) : 0
@@ -1641,7 +1836,11 @@ export default function App() {
         }
       }
 
-      renderer.render(scene, camera);
+      if (s.hdrpMode) {
+        composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
       if (isSoftwareGl) afterDraw(tick);
       else frameId = requestAnimationFrame(tick);
     }
@@ -1658,6 +1857,7 @@ export default function App() {
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('resize', onResize);
+      composer.dispose();
       renderer.dispose();
     };
   }, []);
@@ -1820,13 +2020,20 @@ export default function App() {
                 >
                   Operative Skill Trees ({skillPoints} SP)
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setIsStudioModalOpen(true)}
+                  className="px-4 py-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-cyan-500/40 font-semibold text-sm transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  Studio GDD & QA [G]
+                </button>
               </div>
             </div>
           </div>
 
           {/* Flat Borderless Control Hint Line */}
           <div className="text-xs text-slate-400 font-mono-tabular pt-3">
-            WASD Move · Mouse Aim & Fire · Shift Dash · E Hack Terminal · Tab Switch Role (Operative / Sky Analyst) · K Skill Tree · P Pause
+            WASD Move · Mouse Aim & Fire · Q Class Ability · Shift Dash · E Hack Terminal · Tab Switch Role · K Skill Tree · G Studio GDD
           </div>
         </section>
       )}
@@ -1937,6 +2144,18 @@ export default function App() {
 
               <button
                 type="button"
+                onClick={() => setHdrpMode((prev) => !prev)}
+                className={`px-3 py-2 rounded-lg text-xs font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                  hdrpMode
+                    ? 'ink-panel-accent text-emerald-300'
+                    : 'ink-panel text-slate-400 hover:text-white'
+                }`}
+              >
+                HDRP {hdrpMode ? 'ULTRA [H]' : 'RAW [H]'}
+              </button>
+
+              <button
+                type="button"
                 aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
                 onClick={(e) => {
                   e.currentTarget.blur();
@@ -2032,6 +2251,21 @@ export default function App() {
 
                 <div className="border-l border-slate-800 pl-4">
                   <div className="text-[10px] font-mono-tabular uppercase text-slate-400">
+                    [Q] {CLASS_ABILITIES[activeOperative].name}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      simRef.current.classAbilityRequested = true;
+                    }}
+                    className="font-display text-sm font-bold text-cyan-300 font-mono-tabular cursor-pointer"
+                  >
+                    {abilityCooldown > 0 ? `${abilityCooldown.toFixed(1)}s` : 'READY [Q]'}
+                  </button>
+                </div>
+
+                <div className="border-l border-slate-800 pl-4">
+                  <div className="text-[10px] font-mono-tabular uppercase text-slate-400">
                     Kinetic Dash [Shift]
                   </div>
                   <div className="font-display text-sm font-bold text-amber-300 font-mono-tabular">
@@ -2052,6 +2286,7 @@ export default function App() {
           effectiveStats={effectiveStats}
           activeModifiers={activeModifiers}
           heatmapPoints={analystSnapshot.heatmap}
+          circleState={circleState}
           operativePos={analystSnapshot.operativePos}
           squadPositions={analystSnapshot.squadPositions}
           enemies={analystSnapshot.enemies}
@@ -2069,6 +2304,57 @@ export default function App() {
           onSwitchToOperative={() => setRoleMode('operative')}
         />
       )}
+
+      {/* STUDIO GDD & QA PIPELINE CODEX MODAL */}
+      <StudioPipelineModal
+        isOpen={isStudioModalOpen}
+        onClose={() => setIsStudioModalOpen(false)}
+        onRunQaPreset={(preset) => {
+          setIsStudioModalOpen(false);
+          if (preset === 'cloak_storm') {
+            setActiveModifiers([
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'cloaked_ai')!,
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'overclocked_hunters')!,
+            ]);
+            setWeather({
+              current: 'TORRENTIAL_RAIN',
+              next: 'DENSE_FOG',
+              timeRemainingSec: 32,
+              cycleDurationSec: 32,
+              analystFilterActive: true,
+            });
+            handleSwitchOperativeClass('specter');
+          } else if (preset === 'scarcity_fog') {
+            setActiveModifiers([
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'limited_ammo')!,
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'halved_sim_time')!,
+            ]);
+            setWeather({
+              current: 'DENSE_FOG',
+              next: 'EM_SQUALL',
+              timeRemainingSec: 32,
+              cycleDurationSec: 32,
+              analystFilterActive: true,
+            });
+            handleSwitchOperativeClass('vanguard');
+          } else {
+            setActiveModifiers([
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'loot_rarity_50')!,
+              ALL_MISSION_MODIFIERS.find((m) => m.id === 'cloaked_ai')!,
+            ]);
+            setWeather({
+              current: 'EM_SQUALL',
+              next: 'CLEAR',
+              timeRemainingSec: 32,
+              cycleDurationSec: 32,
+              analystFilterActive: true,
+            });
+            setDataCurrency(120);
+            handleSwitchOperativeClass('warden');
+          }
+          handleStartMatch(selectedDropZone);
+        }}
+      />
 
       {/* OPERATIVE SKILL TREE MODAL */}
       <SkillTreeModal

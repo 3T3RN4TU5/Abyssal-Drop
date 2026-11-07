@@ -759,3 +759,126 @@ export function computeProbabilityHeatmap(
   }
   return points;
 }
+
+export interface CircleClosureState {
+  phase: 1 | 2 | 3;
+  centerX: number;
+  centerZ: number;
+  currentRadius: number;
+  targetRadius: number;
+  nextCenterX: number;
+  nextCenterZ: number;
+  shrinkSpeed: number;
+  damagePerSecOutside: number;
+}
+
+export function createInitialCircleState(): CircleClosureState {
+  return {
+    phase: 1,
+    centerX: 0,
+    centerZ: -4,
+    currentRadius: 50,
+    targetRadius: 36,
+    nextCenterX: 0,
+    nextCenterZ: -20,
+    shrinkSpeed: 0.45,
+    damagePerSecOutside: 4,
+  };
+}
+
+export function advanceCircleClosure(
+  state: CircleClosureState,
+  dt: number
+): CircleClosureState {
+  const nextRadius = Math.max(
+    state.targetRadius,
+    Number((state.currentRadius - state.shrinkSpeed * dt).toFixed(3))
+  );
+
+  if (nextRadius <= state.targetRadius && state.phase < 3) {
+    const nextPhase = (state.phase + 1) as 2 | 3;
+    return {
+      phase: nextPhase,
+      centerX: state.nextCenterX,
+      centerZ: state.nextCenterZ,
+      currentRadius: state.targetRadius,
+      targetRadius: nextPhase === 2 ? 25 : 15,
+      nextCenterX: 0,
+      nextCenterZ: -34, // Final circle converges on Extraction Spire
+      shrinkSpeed: nextPhase === 2 ? 0.55 : 0.65,
+      damagePerSecOutside: nextPhase === 2 ? 7 : 11,
+    };
+  }
+
+  return {
+    ...state,
+    currentRadius: nextRadius,
+  };
+}
+
+export function isOutsideSafeCircle(
+  x: number,
+  z: number,
+  circle: CircleClosureState
+): boolean {
+  return Math.hypot(x - circle.centerX, z - circle.centerZ) > circle.currentRadius;
+}
+
+export interface ClassAbilitySpec {
+  operativeId: OperativeClassId;
+  name: string;
+  keyHint: string;
+  cooldownSec: number;
+  summary: string;
+}
+
+export const CLASS_ABILITIES: Record<OperativeClassId, ClassAbilitySpec> = {
+  vanguard: {
+    operativeId: 'vanguard',
+    name: 'Frag Fan Barrage',
+    keyHint: 'Q',
+    cooldownSec: 8,
+    summary: 'Fires a 5-round high-velocity tungsten fan burst in a forward arc.',
+  },
+  specter: {
+    operativeId: 'specter',
+    name: 'Thermoptic Overdrive',
+    keyHint: 'Q',
+    cooldownSec: 10,
+    summary: 'Cloaks squad signature for 5s, sheds enemy lock-on, and boosts speed +30%.',
+  },
+  warden: {
+    operativeId: 'warden',
+    name: 'Bastion Nano-Pulse',
+    keyHint: 'Q',
+    cooldownSec: 11,
+    summary: 'Restores +40 Armor HP immediately and emits an arc-shockwave around Aegis-3.',
+  },
+};
+
+export const ENEMY_LOADOUT_PROFILES: Record<
+  EnemyArchetype,
+  { weaponName: string; armorRating: string; tacticalThreat: string }
+> = {
+  chaser: {
+    weaponName: 'Twin Mantis Arc-Blades',
+    armorRating: 'Light Composite',
+    tacticalThreat: 'High-speed melee & close-quarters pressure',
+  },
+  kiter: {
+    weaponName: 'Long-Rail Hypervelocity Rifle',
+    armorRating: 'Medium Ballistic',
+    tacticalThreat: 'Standoff precision sniper with windup laser',
+  },
+  interceptor: {
+    weaponName: 'Vector Carbine + Thruster Rig',
+    armorRating: 'Medium Reactive',
+    tacticalThreat: 'Predicts and cuts off Extraction Spire corridors',
+  },
+  suppressor: {
+    weaponName: 'Heavy Rotary Plasma Repeater',
+    armorRating: 'Heavy Frontal Shield',
+    tacticalThreat: 'Area-denial anchor guarding unhacked Data Terminals',
+  },
+};
+

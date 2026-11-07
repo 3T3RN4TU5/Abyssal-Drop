@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import {
+  CircleClosureState,
   ComputedOperativeStats,
+  ENEMY_LOADOUT_PROFILES,
+  EnemyArchetype,
   HeatmapPoint,
   MissionModifier,
   WEATHER_CONFIGS,
@@ -13,6 +16,7 @@ interface AnalystOverlayProps {
   effectiveStats: ComputedOperativeStats;
   activeModifiers: MissionModifier[];
   heatmapPoints: HeatmapPoint[];
+  circleState: CircleClosureState;
   operativePos: { x: number; z: number };
   squadPositions: Array<{ callsign: string; x: number; z: number; color: string }>;
   enemies: Array<{
@@ -55,6 +59,7 @@ export const AnalystOverlay: React.FC<AnalystOverlayProps> = ({
   effectiveStats,
   activeModifiers,
   heatmapPoints,
+  circleState,
   operativePos,
   squadPositions,
   enemies,
@@ -76,6 +81,10 @@ export const AnalystOverlay: React.FC<AnalystOverlayProps> = ({
     ? rawInterference * 0.15
     : rawInterference;
   const signalClarityPct = Math.round((1 - effectiveInterference) * 100);
+
+  const hackedCount = terminals.filter((t) => t.hacked).length;
+  const layer2LoadoutsUnlocked = hackedCount >= 1 || dataCurrency >= 55;
+  const layer3CirclePredUnlocked = hackedCount >= 2 || dataCurrency >= 75;
 
   const reconCost = Math.round(25 * effectiveStats.analystCostMultiplier);
   const empCost = Math.round(40 * effectiveStats.analystCostMultiplier);
@@ -102,7 +111,7 @@ export const AnalystOverlay: React.FC<AnalystOverlayProps> = ({
     <div className="fixed inset-0 pointer-events-none z-20 flex flex-col justify-between p-4">
       {/* Top Analyst Telemetry Bar */}
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="ink-panel-accent rounded-lg px-4 py-3 pointer-events-auto max-w-md">
+        <div className="ink-panel-accent rounded-lg px-4 py-3 pointer-events-auto max-w-md space-y-2">
           <div className="flex items-center justify-between gap-4">
             <div>
               <p className="text-[11px] font-mono-tabular uppercase tracking-wider text-cyan-400">
@@ -120,12 +129,33 @@ export const AnalystOverlay: React.FC<AnalystOverlayProps> = ({
               Return to Ground [Tab]
             </button>
           </div>
-          <div className="mt-2 flex items-center gap-3 text-xs text-slate-300 font-mono-tabular">
+          <div className="flex items-center gap-3 text-xs text-slate-300 font-mono-tabular">
             <span>Sim Horizon: {(4.0 * effectiveStats.analystSimHorizonMultiplier).toFixed(1)}s</span>
             <span aria-hidden="true">·</span>
             <span>Clarity: {signalClarityPct}%</span>
             <span aria-hidden="true">·</span>
             <span className="text-cyan-300 font-semibold">Data: {dataCurrency} GB</span>
+          </div>
+
+          {/* Unlocked Deep Map Layers Status */}
+          <div className="pt-2 border-t border-slate-800 text-[11px] font-mono-tabular space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Layer 2 (Enemy Loadouts):</span>
+              <span className={layer2LoadoutsUnlocked ? 'text-emerald-400 font-semibold' : 'text-amber-300'}>
+                {layer2LoadoutsUnlocked ? 'UNLOCKED' : 'Hack 1 Terminal / 55 GB'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Layer 3 (Next Circle Closure):</span>
+              <span className={layer3CirclePredUnlocked ? 'text-emerald-400 font-semibold' : 'text-amber-300'}>
+                {layer3CirclePredUnlocked ? `PHASE ${circleState.phase} PREDICTED` : 'Hack 2 Terminals / 75 GB'}
+              </span>
+            </div>
+            {layer2LoadoutsUnlocked && enemies.length > 0 && (
+              <div className="text-[10px] text-cyan-300 truncate pt-0.5">
+                Hostile Loadout: {ENEMY_LOADOUT_PROFILES[enemies[0].archetype as EnemyArchetype]?.weaponName} ({ENEMY_LOADOUT_PROFILES[enemies[0].archetype as EnemyArchetype]?.armorRating})
+              </div>
+            )}
           </div>
         </div>
 
@@ -173,6 +203,39 @@ export const AnalystOverlay: React.FC<AnalystOverlayProps> = ({
                   <line x1="0" y1={g} x2="100" y2={g} />
                 </g>
               ))}
+
+              {/* Current Abyssal Circle Closure Ring */}
+              {(() => {
+                const { cx, cy } = toMapCoord(circleState.centerX, circleState.centerZ);
+                const r = (circleState.currentRadius / 110) * 100;
+                return (
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={r}
+                    fill="none"
+                    stroke="rgba(168, 85, 247, 0.75)"
+                    strokeWidth="0.8"
+                  />
+                );
+              })()}
+
+              {/* Layer 3: Predicted Next Circle Closure Ring */}
+              {layer3CirclePredUnlocked && (() => {
+                const { cx, cy } = toMapCoord(circleState.nextCenterX, circleState.nextCenterZ);
+                const r = (circleState.targetRadius / 110) * 100;
+                return (
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={r}
+                    fill="none"
+                    stroke="rgba(56, 189, 248, 0.85)"
+                    strokeWidth="0.7"
+                    strokeDasharray="2.5 1.5"
+                  />
+                );
+              })()}
 
               {/* Probability Heatmap Cells */}
               {heatmapPoints.map((pt, idx) => {

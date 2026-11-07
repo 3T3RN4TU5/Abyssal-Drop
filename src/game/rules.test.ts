@@ -9,6 +9,9 @@ import {
   allocateSkillPoint,
   computeEffectiveStats,
   computeProbabilityHeatmap,
+  createInitialCircleState,
+  advanceCircleClosure,
+  isOutsideSafeCircle,
   UnlockedSkillsMap,
   WeatherState,
 } from './rules';
@@ -131,3 +134,17 @@ test('computeProbabilityHeatmap generates grid cells with threat and loot probab
     assert.ok(cell.lootDensity >= 0 && cell.lootDensity <= 1);
   }
 });
+
+test('advanceCircleClosure shrinks safe zone and transitions phases toward Extraction Spire', () => {
+  const c0 = createInitialCircleState();
+  assert.equal(c0.phase, 1);
+  assert.equal(isOutsideSafeCircle(0, -4, c0), false);
+  assert.equal(isOutsideSafeCircle(48, 48, c0), true);
+
+  // Advance enough seconds to reach targetRadius (50 -> 36 at 0.45/s = 32s)
+  const c1 = advanceCircleClosure(c0, 35);
+  assert.equal(c1.phase, 2);
+  assert.equal(c1.currentRadius, 36);
+  assert.equal(c1.targetRadius, 25);
+});
+
