@@ -17,6 +17,7 @@ import {
   formatEliminationKillfeed,
   formatExtractionMilestoneKillfeed,
   pruneAndFadeKillfeed,
+  getKillfeedLifecycleClasses,
   UnlockedSkillsMap,
   WeatherState,
 } from './rules';
@@ -214,6 +215,17 @@ test('Killfeed engine formats combat eliminations, extraction milestones, and fa
   assert.equal(activeAt175.length, 1);
   assert.equal(activeAt175[0].id, 2);
   assert.ok(activeAt175[0].opacity < 1 && activeAt175[0].opacity > 0);
+
+  // Entry-level slide-in and fade-out Tailwind utility classes
+  assert.equal(
+    getKillfeedLifecycleClasses(false, 1.0),
+    'opacity-0 translate-x-8 translate-y-0 scale-95'
+  );
+  assert.equal(
+    getKillfeedLifecycleClasses(true, 1.0),
+    'opacity-100 translate-x-0 translate-y-0 scale-100'
+  );
+  assert.ok(getKillfeedLifecycleClasses(true, 0.3).includes('opacity-30'));
 });
 
 

@@ -616,6 +616,16 @@ export default function App() {
       setStatusBanner(
         `Squad Order Issued [C]: ${SQUAD_ORDERS[next].label} — ${SQUAD_ORDERS[next].description}`
       );
+      const s = simRef.current;
+      s.killfeed.push({
+        id: s.killfeedCounter++,
+        actor: 'Squad command',
+        verb: 'issued',
+        subject: SQUAD_ORDERS[next].label,
+        category: 'TACTICAL',
+        createdAtSec: s.matchTimeSec,
+        ttlSec: 7.5,
+      });
       sound.playAnalystPulse();
       return next;
     });

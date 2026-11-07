@@ -1197,5 +1197,29 @@ export function pruneAndFadeKillfeed(
   return active.slice(-maxVisible);
 }
 
+export function getKillfeedLifecycleClasses(
+  isEntered: boolean,
+  opacity: number
+): string {
+  // Entry-level fading slide-in from the right before settling into position
+  if (!isEntered) {
+    return 'opacity-0 translate-x-8 translate-y-0 scale-95';
+  }
+  // Smooth monochrome fade-out & subtle upward drift as entry approaches TTL expiration
+  if (opacity >= 0.85) {
+    return 'opacity-100 translate-x-0 translate-y-0 scale-100';
+  }
+  if (opacity >= 0.65) {
+    return 'opacity-80 translate-x-0.5 -translate-y-0.5 scale-100';
+  }
+  if (opacity >= 0.45) {
+    return 'opacity-55 translate-x-1 -translate-y-0.5 scale-[0.99]';
+  }
+  if (opacity >= 0.25) {
+    return 'opacity-30 translate-x-2 -translate-y-1 scale-[0.98]';
+  }
+  return 'opacity-10 translate-x-3 -translate-y-1.5 scale-95';
+}
+
 
 
