@@ -1,0 +1,6 @@
+{
+  "name": "Abyssal Drop",
+  "description": "Asymmetrical 3D tactical extraction shooter and real-time multi-agent strategy game where ground Operatives and a sky Analyst coordinate using predictive heatmaps, terminal hacking, and ink-and-splash threat telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,761 @@
+/**
+ * Pure decoupled game rules, Mission Modifiers, Dynamic Weather System,
+ * Operative Skill Trees, and Multi-Agent Analyst Heatmap math.
+ */
+
+export type RoleMode = 'operative' | 'analyst';
+export type GamePhase = 'title' | 'playing' | 'paused' | 'gameover';
+export type OperativeClassId = 'vanguard' | 'specter' | 'warden';
+export type WeatherId = 'CLEAR' | 'DENSE_FOG' | 'TORRENTIAL_RAIN' | 'EM_SQUALL';
+export type EnemyArchetype = 'chaser' | 'kiter' | 'interceptor' | 'suppressor';
+
+export interface MissionModifier {
+  id: string;
+  name: string;
+  category: 'AI_HAZARD' | 'LOOT_ECONOMY' | 'RESOURCE_CONSTRAINT' | 'ANALYST_CONSTRAINT';
+  shortDesc: string;
+  operativeImpact: string;
+  analystImpact: string;
+  effects: {
+    enemyCloaked?: boolean;
+    lootMultiplier?: number;
+    ammoCapacityMultiplier?: number;
+    analystSimHorizonMultiplier?: number;
+    enemySpeedMultiplier?: number;
+    hackYieldBonus?: number;
+  };
+}
+
+export const ALL_MISSION_MODIFIERS: MissionModifier[] = [
+  {
+    id: 'cloaked_ai',
+    name: 'All Enemy AI Are Cloaked',
+    category: 'AI_HAZARD',
+    shortDesc: 'AI faction units deploy thermoptic stealth camouflage beyond 14m unless pinged by Analyst Recon.',
+    operativeImpact: 'Hostiles shimmer at range; close within 14m or use Counter-Cloak Optics.',
+    analystImpact: 'Standard optical feed masked; use Recon Pulse or Heatmap probability vectors.',
+    effects: {
+      enemyCloaked: true,
+    },
+  },
+  {
+    id: 'loot_rarity_50',
+    name: 'Loot Rarity Increased by 50%',
+    category: 'LOOT_ECONOMY',
+    shortDesc: 'High-density encrypted caches boost all Terminal Data extractions and supply yields by +50%.',
+    operativeImpact: 'Supply crates restore +50% more ammo and armor plating.',
+    analystImpact: 'Terminal hacks yield +50% raw Data (GB) for rapid map-layer unlocks.',
+    effects: {
+      lootMultiplier: 1.5,
+      hackYieldBonus: 15,
+    },
+  },
+  {
+    id: 'limited_ammo',
+    name: 'Operatives Have Limited Ammo',
+    category: 'RESOURCE_CONSTRAINT',
+    shortDesc: 'Strict drop-weight limits cut magazine & reserve capacity by 45%, but high-grain rounds deal +20% damage.',
+    operativeImpact: 'Max magazine reduced by 45%; conserve shots or request Analyst Supply Drops.',
+    analystImpact: 'Monitor squad ammunition closely and route Operatives through supply caches.',
+    effects: {
+      ammoCapacityMultiplier: 0.55,
+    },
+  },
+  {
+    id: 'halved_sim_time',
+    name: "Analyst's Simulation Time Is Halved",
+    category: 'ANALYST_CONSTRAINT',
+    shortDesc: 'Ionospheric interference halves multi-agent prediction horizon and Recon scan duration.',
+    operativeImpact: 'Waypoint updates and threat pings expire twice as fast.',
+    analystImpact: 'Predictive trajectory lookahead is 50% shorter; refresh scans frequently.',
+    effects: {
+      analystSimHorizonMultiplier: 0.5,
+    },
+  },
+  {
+    id: 'overclocked_hunters',
+    name: 'Hyper-Adaptive AI Patrols',
+    category: 'AI_HAZARD',
+    shortDesc: 'AI interception squads move 20% faster toward historical Operative movement corridors.',
+    operativeImpact: 'Hostile flankers close distance rapidly after terminal breaches.',
+    analystImpact: 'Choke-point heat builds 25% faster along repeated squad paths.',
+    effects: {
+      enemySpeedMultiplier: 1.2,
+    },
+  },
+];
+
+export function rollMissionModifiers(seed = Date.now(), count = 2): MissionModifier[] {
+  const pool = [...ALL_MISSION_MODIFIERS];
+  const selected: MissionModifier[] = [];
+  let s = Math.abs(Math.floor(seed)) || 1337;
+  for (let i = 0; i < count && pool.length > 0; i++) {
+    s = (s * 1664525 + 1013904223) % 4294967296;
+    const idx = s % pool.length;
+    selected.push(pool[idx]);
+    pool.splice(idx, 1);
+  }
+  return selected;
+}
+
+export interface WeatherConfig {
+  id: WeatherId;
+  name: string;
+  tagline: string;
+  fogDensity: number;
+  sightRangeMeters: number;
+  audioPropagationMultiplier: number; // < 1 means footsteps are masked, audio cues shorter
+  aiDetectionRadiusMultiplier: number;
+  analystInterference: number; // 0 to 1 raw noise before Analyst weather filter
+  filterModeName: string;
+  ambientTintHex: number;
+}
+
+export const WEATHER_CONFIGS: Record<WeatherId, WeatherConfig> = {
+  CLEAR: {
+    id: 'CLEAR',
+    name: 'Clear Obsidian Night',
+    tagline: 'Unobstructed thermal & acoustic telemetry across the basin.',
+    fogDensity: 0.009,
+    sightRangeMeters: 75,
+    audioPropagationMultiplier: 1.0,
+    aiDetectionRadiusMultiplier: 1.0,
+    analystInterference: 0.05,
+    filterModeName: 'Standard Optical',
+    ambientTintHex: 0x0b111e,
+  },
+  DENSE_FOG: {
+    id: 'DENSE_FOG',
+    name: 'Abyssal Dense Fog',
+    tagline: 'Heavy vapor bank cuts Operative sight range by 45%.',
+    fogDensity: 0.024,
+    sightRangeMeters: 41,
+    audioPropagationMultiplier: 0.9,
+    aiDetectionRadiusMultiplier: 0.72,
+    analystInterference: 0.55,
+    filterModeName: 'Millimeter-Wave Piercer',
+    ambientTintHex: 0x131c27,
+  },
+  TORRENTIAL_RAIN: {
+    id: 'TORRENTIAL_RAIN',
+    name: 'Torrential Ink-Rain',
+    tagline: 'Downpour masks Operative footsteps (-35% AI acoustic detection) and dampens distant audio.',
+    fogDensity: 0.015,
+    sightRangeMeters: 56,
+    audioPropagationMultiplier: 0.62,
+    aiDetectionRadiusMultiplier: 0.65,
+    analystInterference: 0.35,
+    filterModeName: 'Acoustic Doppler Gate',
+    ambientTintHex: 0x091322,
+  },
+  EM_SQUALL: {
+    id: 'EM_SQUALL',
+    name: 'Electromagnetic Squall',
+    tagline: 'Charged squall distorts raw sensors but supercharges Terminal Data yield (+25%).',
+    fogDensity: 0.018,
+    sightRangeMeters: 48,
+    audioPropagationMultiplier: 0.8,
+    aiDetectionRadiusMultiplier: 0.85,
+    analystInterference: 0.7,
+    filterModeName: 'Quantum Spectral Lock',
+    ambientTintHex: 0x141126,
+  },
+};
+
+export const WEATHER_SEQUENCE: WeatherId[] = [
+  'CLEAR',
+  'TORRENTIAL_RAIN',
+  'DENSE_FOG',
+  'EM_SQUALL',
+];
+
+export interface WeatherState {
+  current: WeatherId;
+  next: WeatherId;
+  timeRemainingSec: number;
+  cycleDurationSec: number;
+  analystFilterActive: boolean;
+}
+
+export function advanceWeatherSystem(
+  state: WeatherState,
+  dt: number
+): WeatherState {
+  const remaining = state.timeRemainingSec - dt;
+  if (remaining > 0) {
+    return {
+      ...state,
+      timeRemainingSec: remaining,
+    };
+  }
+  const currentIdx = WEATHER_SEQUENCE.indexOf(state.next);
+  const nextIdx = (currentIdx + 1) % WEATHER_SEQUENCE.length;
+  return {
+    current: state.next,
+    next: WEATHER_SEQUENCE[nextIdx],
+    timeRemainingSec: state.cycleDurationSec,
+    cycleDurationSec: state.cycleDurationSec,
+    analystFilterActive: state.analystFilterActive,
+  };
+}
+
+export function computeEffectiveWeatherMetrics(
+  weather: WeatherState,
+  stealthSkillNoiseReduction = 0
+) {
+  const cfg = WEATHER_CONFIGS[weather.current];
+  const effectiveInterference = weather.analystFilterActive
+    ? cfg.analystInterference * 0.15
+    : cfg.analystInterference;
+  const analystClarityPct = Math.round((1 - effectiveInterference) * 100);
+  const footstepMaskingPct = Math.min(
+    80,
+    Math.round((1 - cfg.audioPropagationMultiplier + stealthSkillNoiseReduction) * 100)
+  );
+  return {
+    config: cfg,
+    effectiveInterference,
+    analystClarityPct,
+    footstepMaskingPct,
+    effectiveSightRangeMeters: cfg.sightRangeMeters,
+    effectiveAiDetectionMultiplier: Math.max(
+      0.35,
+      cfg.aiDetectionRadiusMultiplier * (1 - stealthSkillNoiseReduction * 0.6)
+    ),
+  };
+}
+
+export interface SkillNode {
+  id: string;
+  operativeId: OperativeClassId;
+  branch: 'MOBILITY' | 'COMBAT_HACKING' | 'ANALYST_SYNERGY';
+  tier: 1 | 2;
+  name: string;
+  description: string;
+  cost: number;
+  prerequisiteId?: string;
+  bonuses: {
+    moveSpeedPct?: number;
+    dashCooldownReductionPct?: number;
+    hackSpeedPct?: number;
+    dataYieldPct?: number;
+    weaponDamagePct?: number;
+    ammoCapacityPct?: number;
+    maxHpBonus?: number;
+    stealthNoiseReduction?: number;
+    cloakRevealRangeBonusMeters?: number;
+    analystCostReductionPct?: number;
+    empTrapBonusPct?: number;
+    targetTagDurationBonusSec?: number;
+  };
+}
+
+export interface OperativeClassProfile {
+  id: OperativeClassId;
+  callsign: string;
+  title: string;
+  roleSummary: string;
+  accentColor: string;
+  baseHp: number;
+  baseSpeed: number;
+  baseMagazine: number;
+  baseDamage: number;
+  baseHackTimeSec: number;
+  skills: SkillNode[];
+}
+
+export const OPERATIVE_CLASSES: Record<OperativeClassId, OperativeClassProfile> = {
+  vanguard: {
+    id: 'vanguard',
+    callsign: 'KESTREL-1',
+    title: 'Vanguard Breacher',
+    roleSummary: 'Point-man assault specialist with high-velocity dash jets and armor-piercing ballistics.',
+    accentColor: '#f59e0b',
+    baseHp: 110,
+    baseSpeed: 10.5,
+    baseMagazine: 28,
+    baseDamage: 26,
+    baseHackTimeSec: 3.6,
+    skills: [
+      {
+        id: 'van_mob_1',
+        operativeId: 'vanguard',
+        branch: 'MOBILITY',
+        tier: 1,
+        name: 'Hydraulic Thrusters',
+        description: '+18% movement speed and smoother cornering across wet basin terrain.',
+        cost: 1,
+        bonuses: { moveSpeedPct: 18 },
+      },
+      {
+        id: 'van_mob_2',
+        operativeId: 'vanguard',
+        branch: 'MOBILITY',
+        tier: 2,
+        name: 'Kinetic Afterburner',
+        description: 'Reduces tactical Dash cooldown by 35% and leaves an ink-decoy wake.',
+        cost: 2,
+        prerequisiteId: 'van_mob_1',
+        bonuses: { dashCooldownReductionPct: 35, moveSpeedPct: 8 },
+      },
+      {
+        id: 'van_com_1',
+        operativeId: 'vanguard',
+        branch: 'COMBAT_HACKING',
+        tier: 1,
+        name: 'Tungsten Sabot Core',
+        description: '+25% carbine damage against AI faction armor plating.',
+        cost: 1,
+        bonuses: { weaponDamagePct: 25 },
+      },
+      {
+        id: 'van_com_2',
+        operativeId: 'vanguard',
+        branch: 'COMBAT_HACKING',
+        tier: 2,
+        name: 'Expanded Drum Rig',
+        description: '+45% magazine capacity, offsetting Scarcity ammo constraints.',
+        cost: 2,
+        prerequisiteId: 'van_com_1',
+        bonuses: { ammoCapacityPct: 45, weaponDamagePct: 10 },
+      },
+      {
+        id: 'van_syn_1',
+        operativeId: 'vanguard',
+        branch: 'ANALYST_SYNERGY',
+        tier: 1,
+        name: 'Ballistic Tracer Link',
+        description: 'Enemies hit by Kestrel-1 stay illuminated on the Analyst heatmap for +6s.',
+        cost: 1,
+        bonuses: { targetTagDurationBonusSec: 6, cloakRevealRangeBonusMeters: 8 },
+      },
+      {
+        id: 'van_syn_2',
+        operativeId: 'vanguard',
+        branch: 'ANALYST_SYNERGY',
+        tier: 2,
+        name: 'Breach Telemetry Surge',
+        description: '+25% terminal hacking speed and +15% Data extracted per breach.',
+        cost: 2,
+        prerequisiteId: 'van_syn_1',
+        bonuses: { hackSpeedPct: 25, dataYieldPct: 15 },
+      },
+    ],
+  },
+  specter: {
+    id: 'specter',
+    callsign: 'WRAITH-2',
+    title: 'Specter Cyber-Infiltrator',
+    roleSummary: 'Stealth recon and rapid terminal decryption operative engineered for Data harvesting.',
+    accentColor: '#06b6d4',
+    baseHp: 95,
+    baseSpeed: 11.4,
+    baseMagazine: 24,
+    baseDamage: 23,
+    baseHackTimeSec: 2.6,
+    skills: [
+      {
+        id: 'spc_mob_1',
+        operativeId: 'specter',
+        branch: 'MOBILITY',
+        tier: 1,
+        name: 'Acoustic Dampener Soles',
+        description: 'Reduces footstep noise by 30% in all weather conditions and boosts speed +12%.',
+        cost: 1,
+        bonuses: { stealthNoiseReduction: 0.3, moveSpeedPct: 12 },
+      },
+      {
+        id: 'spc_mob_2',
+        operativeId: 'specter',
+        branch: 'MOBILITY',
+        tier: 2,
+        name: 'Phase-Step Blink',
+        description: '-40% Dash cooldown and +15m detection range against Cloaked AI.',
+        cost: 2,
+        prerequisiteId: 'spc_mob_1',
+        bonuses: { dashCooldownReductionPct: 40, cloakRevealRangeBonusMeters: 15 },
+      },
+      {
+        id: 'spc_com_1',
+        operativeId: 'specter',
+        branch: 'COMBAT_HACKING',
+        tier: 1,
+        name: 'Quantum Icebreaker',
+        description: '+40% Terminal hacking speed across all encryption tiers.',
+        cost: 1,
+        bonuses: { hackSpeedPct: 40 },
+      },
+      {
+        id: 'spc_com_2',
+        operativeId: 'specter',
+        branch: 'COMBAT_HACKING',
+        tier: 2,
+        name: 'Deep-Packet Siphon',
+        description: '+35% bonus Data currency extracted from every terminal and +20% weapon damage.',
+        cost: 2,
+        prerequisiteId: 'spc_com_1',
+        bonuses: { dataYieldPct: 35, weaponDamagePct: 20 },
+      },
+      {
+        id: 'spc_syn_1',
+        operativeId: 'specter',
+        branch: 'ANALYST_SYNERGY',
+        tier: 1,
+        name: 'Compressed Uplink',
+        description: 'Reduces the Data cost of all Analyst sky abilities by 20%.',
+        cost: 1,
+        bonuses: { analystCostReductionPct: 20 },
+      },
+      {
+        id: 'spc_syn_2',
+        operativeId: 'specter',
+        branch: 'ANALYST_SYNERGY',
+        tier: 2,
+        name: 'Overclocked Relay',
+        description: 'Further reduces Analyst ability cost by 15% and boosts ammo capacity +30%.',
+        cost: 2,
+        prerequisiteId: 'spc_syn_1',
+        bonuses: { analystCostReductionPct: 15, ammoCapacityPct: 30 },
+      },
+    ],
+  },
+  warden: {
+    id: 'warden',
+    callsign: 'AEGIS-3',
+    title: 'Warden Heavy Engineer',
+    roleSummary: 'Armored anchor who fortifies extraction zones and amplifies Analyst environmental traps.',
+    accentColor: '#10b981',
+    baseHp: 135,
+    baseSpeed: 9.8,
+    baseMagazine: 34,
+    baseDamage: 28,
+    baseHackTimeSec: 3.2,
+    skills: [
+      {
+        id: 'war_mob_1',
+        operativeId: 'warden',
+        branch: 'MOBILITY',
+        tier: 1,
+        name: 'Servo-Assisted Frame',
+        description: '+15% movement speed and +25 Max HP ablative plating.',
+        cost: 1,
+        bonuses: { moveSpeedPct: 15, maxHpBonus: 25 },
+      },
+      {
+        id: 'war_mob_2',
+        operativeId: 'warden',
+        branch: 'MOBILITY',
+        tier: 2,
+        name: 'Reactive Shield Surge',
+        description: '+35 Max HP and -25% Dash cooldown when breaching choke points.',
+        cost: 2,
+        prerequisiteId: 'war_mob_1',
+        bonuses: { maxHpBonus: 35, dashCooldownReductionPct: 25 },
+      },
+      {
+        id: 'war_com_1',
+        operativeId: 'warden',
+        branch: 'COMBAT_HACKING',
+        tier: 1,
+        name: 'High-Capacity Feed',
+        description: '+50% magazine capacity and +15% weapon damage.',
+        cost: 1,
+        bonuses: { ammoCapacityPct: 50, weaponDamagePct: 15 },
+      },
+      {
+        id: 'war_com_2',
+        operativeId: 'warden',
+        branch: 'COMBAT_HACKING',
+        tier: 2,
+        name: 'Armored Field Diagnostics',
+        description: '+35% terminal hacking speed and +25% weapon damage.',
+        cost: 2,
+        prerequisiteId: 'war_com_1',
+        bonuses: { hackSpeedPct: 35, weaponDamagePct: 25 },
+      },
+      {
+        id: 'war_syn_1',
+        operativeId: 'warden',
+        branch: 'ANALYST_SYNERGY',
+        tier: 1,
+        name: 'EMP Trap Resonator',
+        description: 'Analyst EMP Traps deal +50% damage and stun AI units across a wider radius.',
+        cost: 1,
+        bonuses: { empTrapBonusPct: 50 },
+      },
+      {
+        id: 'war_syn_2',
+        operativeId: 'warden',
+        branch: 'ANALYST_SYNERGY',
+        tier: 2,
+        name: 'Grid Surge Capacitor',
+        description: '+25% Data yield from hacks and +12m cloaked enemy reveal radius.',
+        cost: 2,
+        prerequisiteId: 'war_syn_1',
+        bonuses: { dataYieldPct: 25, cloakRevealRangeBonusMeters: 12 },
+      },
+    ],
+  },
+};
+
+export type UnlockedSkillsMap = Record<OperativeClassId, string[]>;
+
+export function canAllocateSkill(
+  operativeId: OperativeClassId,
+  skillId: string,
+  unlockedByClass: UnlockedSkillsMap,
+  availableSkillPoints: number
+): { allowed: boolean; reason?: string } {
+  const profile = OPERATIVE_CLASSES[operativeId];
+  const node = profile.skills.find((s) => s.id === skillId);
+  if (!node) return { allowed: false, reason: 'Skill not found' };
+
+  const unlocked = unlockedByClass[operativeId] || [];
+  if (unlocked.includes(skillId)) {
+    return { allowed: false, reason: 'Already unlocked' };
+  }
+  if (node.prerequisiteId && !unlocked.includes(node.prerequisiteId)) {
+    return { allowed: false, reason: 'Requires Tier 1 branch prerequisite' };
+  }
+  if (availableSkillPoints < node.cost) {
+    return { allowed: false, reason: `Requires ${node.cost} SP` };
+  }
+  return { allowed: true };
+}
+
+export function allocateSkillPoint(
+  operativeId: OperativeClassId,
+  skillId: string,
+  unlockedByClass: UnlockedSkillsMap,
+  availableSkillPoints: number
+): {
+  unlockedByClass: UnlockedSkillsMap;
+  availableSkillPoints: number;
+  allocated: boolean;
+} {
+  const check = canAllocateSkill(
+    operativeId,
+    skillId,
+    unlockedByClass,
+    availableSkillPoints
+  );
+  if (!check.allowed) {
+    return { unlockedByClass, availableSkillPoints, allocated: false };
+  }
+  const profile = OPERATIVE_CLASSES[operativeId];
+  const node = profile.skills.find((s) => s.id === skillId)!;
+  return {
+    unlockedByClass: {
+      ...unlockedByClass,
+      [operativeId]: [...(unlockedByClass[operativeId] || []), skillId],
+    },
+    availableSkillPoints: availableSkillPoints - node.cost,
+    allocated: true,
+  };
+}
+
+export interface ComputedOperativeStats {
+  maxHp: number;
+  moveSpeed: number;
+  dashCooldownSec: number;
+  magazineSize: number;
+  weaponDamage: number;
+  hackDurationSec: number;
+  dataYieldMultiplier: number;
+  stealthNoiseReduction: number;
+  cloakRevealDistance: number;
+  analystCostMultiplier: number;
+  empTrapMultiplier: number;
+  analystSimHorizonMultiplier: number;
+  areEnemiesCloaked: boolean;
+}
+
+export function computeEffectiveStats(
+  operativeId: OperativeClassId,
+  unlockedByClass: UnlockedSkillsMap,
+  activeModifiers: MissionModifier[],
+  weather: WeatherState
+): ComputedOperativeStats {
+  const profile = OPERATIVE_CLASSES[operativeId];
+  const unlockedIds = unlockedByClass[operativeId] || [];
+  const unlockedNodes = profile.skills.filter((s) => unlockedIds.includes(s.id));
+
+  let moveSpeedPct = 0;
+  let dashCdRedPct = 0;
+  let hackSpeedPct = 0;
+  let dataYieldPct = 0;
+  let weaponDamagePct = 0;
+  let ammoCapacityPct = 0;
+  let maxHpBonus = 0;
+  let stealthNoiseReduction = 0;
+  let cloakRevealBonus = 0;
+  let analystCostRedPct = 0;
+  let empTrapBonusPct = 0;
+
+  for (const node of unlockedNodes) {
+    const b = node.bonuses;
+    moveSpeedPct += b.moveSpeedPct || 0;
+    dashCdRedPct += b.dashCooldownReductionPct || 0;
+    hackSpeedPct += b.hackSpeedPct || 0;
+    dataYieldPct += b.dataYieldPct || 0;
+    weaponDamagePct += b.weaponDamagePct || 0;
+    ammoCapacityPct += b.ammoCapacityPct || 0;
+    maxHpBonus += b.maxHpBonus || 0;
+    stealthNoiseReduction += b.stealthNoiseReduction || 0;
+    cloakRevealBonus += b.cloakRevealRangeBonusMeters || 0;
+    analystCostRedPct += b.analystCostReductionPct || 0;
+    empTrapBonusPct += b.empTrapBonusPct || 0;
+  }
+
+  let modLootMult = 1.0;
+  let modAmmoMult = 1.0;
+  let modSimHorizonMult = 1.0;
+  let areEnemiesCloaked = false;
+
+  for (const mod of activeModifiers) {
+    if (mod.effects.enemyCloaked) areEnemiesCloaked = true;
+    if (mod.effects.lootMultiplier) modLootMult *= mod.effects.lootMultiplier;
+    if (mod.effects.ammoCapacityMultiplier) {
+      modAmmoMult *= mod.effects.ammoCapacityMultiplier;
+    }
+    if (mod.effects.analystSimHorizonMultiplier) {
+      modSimHorizonMult *= mod.effects.analystSimHorizonMultiplier;
+    }
+  }
+
+  // EM Squall boosts data yield by +25%
+  const weatherDataBonus = weather.current === 'EM_SQUALL' ? 1.25 : 1.0;
+  // Limited ammo modifier also gives high-grain +20% damage
+  const limitedAmmoDamageBonus = modAmmoMult < 1 ? 1.2 : 1.0;
+
+  const maxHp = Math.round(profile.baseHp + maxHpBonus);
+  const moveSpeed = Number((profile.baseSpeed * (1 + moveSpeedPct / 100)).toFixed(2));
+  const dashCooldownSec = Number(
+    Math.max(0.9, 2.6 * (1 - dashCdRedPct / 100)).toFixed(2)
+  );
+  const magazineSize = Math.max(
+    6,
+    Math.round(profile.baseMagazine * (1 + ammoCapacityPct / 100) * modAmmoMult)
+  );
+  const weaponDamage = Math.round(
+    profile.baseDamage * (1 + weaponDamagePct / 100) * limitedAmmoDamageBonus
+  );
+  const hackDurationSec = Number(
+    Math.max(1.1, profile.baseHackTimeSec / (1 + hackSpeedPct / 100)).toFixed(2)
+  );
+  const dataYieldMultiplier = Number(
+    ((1 + dataYieldPct / 100) * modLootMult * weatherDataBonus).toFixed(2)
+  );
+
+  return {
+    maxHp,
+    moveSpeed,
+    dashCooldownSec,
+    magazineSize,
+    weaponDamage,
+    hackDurationSec,
+    dataYieldMultiplier,
+    stealthNoiseReduction: Math.min(0.65, stealthNoiseReduction),
+    cloakRevealDistance: 14 + cloakRevealBonus,
+    analystCostMultiplier: Math.max(0.5, 1 - analystCostRedPct / 100),
+    empTrapMultiplier: 1 + empTrapBonusPct / 100,
+    analystSimHorizonMultiplier: modSimHorizonMult,
+    areEnemiesCloaked,
+  };
+}
+
+export interface DropZoneOption {
+  id: 'alpha' | 'bravo' | 'charlie';
+  name: string;
+  sectorCode: string;
+  coordinates: { x: number; z: number };
+  lootRating: number; // 1-100
+  threatProbability: number; // 1-100
+  summary: string;
+}
+
+export const DROP_ZONES: DropZoneOption[] = [
+  {
+    id: 'alpha',
+    name: 'Sunken Server Vault',
+    sectorCode: 'SEC-A01',
+    coordinates: { x: -24, z: 22 },
+    lootRating: 92,
+    threatProbability: 68,
+    summary: 'High Data terminal density with multi-level obsidian cover walls.',
+  },
+  {
+    id: 'bravo',
+    name: 'Monolith Spire Perimeter',
+    sectorCode: 'SEC-B04',
+    coordinates: { x: 0, z: 28 },
+    lootRating: 78,
+    threatProbability: 42,
+    summary: 'Balanced drop trajectory with clear sightlines to the Extraction Pad.',
+  },
+  {
+    id: 'charlie',
+    name: 'Hydro-Reactor Basin',
+    sectorCode: 'SEC-C09',
+    coordinates: { x: 24, z: 20 },
+    lootRating: 86,
+    threatProbability: 58,
+    summary: 'Flanking approach near dual EMP capacitor traps and encrypted relays.',
+  },
+];
+
+export interface HeatmapPoint {
+  x: number;
+  z: number;
+  threatProbability: number; // 0..1
+  lootDensity: number; // 0..1
+}
+
+export function computeProbabilityHeatmap(
+  enemies: Array<{ x: number; z: number; vx: number; vz: number }>,
+  terminals: Array<{ x: number; z: number; hacked: boolean }>,
+  operativeHistory: Array<{ x: number; z: number }>,
+  simHorizonSec: number,
+  gridSize = 8
+): HeatmapPoint[] {
+  const points: HeatmapPoint[] = [];
+  const halfSpan = 48;
+  const step = (halfSpan * 2) / (gridSize - 1);
+
+  for (let gx = 0; gx < gridSize; gx++) {
+    for (let gz = 0; gz < gridSize; gz++) {
+      const wx = -halfSpan + gx * step;
+      const wz = -halfSpan + gz * step;
+
+      let threat = 0.05;
+      for (const e of enemies) {
+        const predX = e.x + e.vx * simHorizonSec;
+        const predZ = e.z + e.vz * simHorizonSec;
+        const distSq = (wx - predX) * (wx - predX) + (wz - predZ) * (wz - predZ);
+        threat += Math.exp(-distSq / 260) * 0.45;
+      }
+
+      // AI adapts to operative historical paths
+      for (const h of operativeHistory) {
+        const distSq = (wx - h.x) * (wx - h.x) + (wz - h.z) * (wz - h.z);
+        threat += Math.exp(-distSq / 320) * 0.12;
+      }
+
+      let loot = 0.05;
+      for (const t of terminals) {
+        if (!t.hacked) {
+          const distSq = (wx - t.x) * (wx - t.x) + (wz - t.z) * (wz - t.z);
+          loot += Math.exp(-distSq / 280) * 0.75;
+        }
+      }
+
+      points.push({
+        x: wx,
+        z: wz,
+        threatProbability: Math.min(1, Number(threat.toFixed(3))),
+        lootDensity: Math.min(1, Number(loot.toFixed(3))),
+      });
+    }
+  }
+  return points;
+}
