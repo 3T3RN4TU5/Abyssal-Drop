@@ -882,3 +882,201 @@ export const ENEMY_LOADOUT_PROFILES: Record<
   },
 };
 
+// ============================================================================
+// 8. COMPANION SQUAD AI & TACTICAL ORDER ENGINE
+// ============================================================================
+
+export type SquadOrderMode =
+  | 'FOLLOW_SUPPORT'
+  | 'BREACH_TERMINAL'
+  | 'AGGRESSIVE_HUNT'
+  | 'HOLD_POSITION';
+
+export interface SquadOrderSpec {
+  id: SquadOrderMode;
+  label: string;
+  shortLabel: string;
+  description: string;
+}
+
+export const SQUAD_ORDERS: Record<SquadOrderMode, SquadOrderSpec> = {
+  FOLLOW_SUPPORT: {
+    id: 'FOLLOW_SUPPORT',
+    label: 'Wedge Escort & Fire Support',
+    shortLabel: 'Escort & Fire',
+    description:
+      'Companions hold a tactical V-wedge around the Lead Operative and automatically engage enemies within 26m.',
+  },
+  BREACH_TERMINAL: {
+    id: 'BREACH_TERMINAL',
+    label: 'Autonomous Terminal Breach',
+    shortLabel: 'Auto-Breach Terminals',
+    description:
+      'Companions sprint to the nearest unhacked Data Terminal, decrypt it for Analyst GB currency, and defend the node.',
+  },
+  AGGRESSIVE_HUNT: {
+    id: 'AGGRESSIVE_HUNT',
+    label: 'Hunter-Killer Sweep',
+    shortLabel: 'Hunt Hostiles',
+    description:
+      'Companions actively push toward the nearest live AI Faction unit to flank and eliminate threats.',
+  },
+  HOLD_POSITION: {
+    id: 'HOLD_POSITION',
+    label: 'Sector Overwatch Anchor',
+    shortLabel: 'Hold Overwatch',
+    description:
+      'Companions anchor at the Analyst Waypoint (or current position) and lay down overlapping turret fire.',
+  },
+};
+
+export function getCompanionClasses(leadClass: OperativeClassId): [OperativeClassId, OperativeClassId] {
+  const all: OperativeClassId[] = ['vanguard', 'specter', 'warden'];
+  const others = all.filter((c) => c !== leadClass);
+  return [others[0], others[1]];
+}
+
+export interface CompanionDecisionInput {
+  companionId: OperativeClassId;
+  slotIndex: 0 | 1;
+  x: number;
+  z: number;
+  leaderX: number;
+  leaderZ: number;
+  leaderYaw: number;
+  orderMode: SquadOrderMode;
+  waypoint: { x: number; z: number } | null;
+  enemies: Array<{ id: string; x: number; z: number; hp: number }>;
+  terminals: Array<{ id: string; x: number; z: number; hacked: boolean }>;
+}
+
+export interface CompanionDecisionOutput {
+  targetX: number;
+  targetZ: number;
+  aimYaw: number;
+  targetEnemyId: string | null;
+  shouldFire: boolean;
+  hackingTerminalId: string | null;
+  actionTag: string;
+}
+
+export function computeCompanionDecision(
+  input: CompanionDecisionInput
+): CompanionDecisionOutput {
+  const {
+    slotIndex,
+    x,
+    z,
+    leaderX,
+    leaderZ,
+    leaderYaw,
+    orderMode,
+    waypoint,
+    enemies,
+    terminals,
+  } = input;
+
+  // 1. Find nearest live enemy within 26m combat engagement envelope
+  let nearestEnemy: { id: string; x: number; z: number; dist: number } | null = null;
+  for (const e of enemies) {
+    if (e.hp <= 0) continue;
+    const d = Math.hypot(e.x - x, e.z - z);
+    if (!nearestEnemy || d < nearestEnemy.dist) {
+      nearestEnemy = { id: e.id, x: e.x, z: e.z, dist: d };
+    }
+  }
+
+  // 2. Find nearest unhacked terminal
+  let nearestTerminal: { id: string; x: number; z: number; dist: number } | null = null;
+  for (const t of terminals) {
+    if (t.hacked) continue;
+    const d = Math.hypot(t.x - x, t.z - z);
+    if (!nearestTerminal || d < nearestTerminal.dist) {
+      nearestTerminal = { id: t.id, x: t.x, z: t.z, dist: d };
+    }
+  }
+
+  const sideSign = slotIndex === 0 ? 1 : -1;
+  let targetX = leaderX;
+  let targetZ = leaderZ;
+  let hackingTerminalId: string | null = null;
+  let actionTag = 'WEDGE OVERWATCH';
+
+  if (orderMode === 'BREACH_TERMINAL' && nearestTerminal) {
+    // Move inside the 3.2m terminal ring to decrypt
+    targetX = nearestTerminal.x + sideSign * 1.45;
+    targetZ = nearestTerminal.z + 1.25;
+    if (nearestTerminal.dist <= 4.1) {
+      hackingTerminalId = nearestTerminal.id;
+      actionTag = `DECRYPTING ${nearestTerminal.id}`;
+    } else {
+      actionTag = `MOVING TO ${nearestTerminal.id}`;
+    }
+  } else if (orderMode === 'AGGRESSIVE_HUNT' && nearestEnemy) {
+    // Strafe around target enemy at 8.5m optimal rifle standoff range
+    const angleToComp = Math.atan2(x - nearestEnemy.x, z - nearestEnemy.z) + sideSign * 0.45;
+    targetX = nearestEnemy.x + Math.sin(angleToComp) * 8.5;
+    targetZ = nearestEnemy.z + Math.cos(angleToComp) * 8.5;
+    actionTag = `HUNTING ${nearestEnemy.id}`;
+  } else if (orderMode === 'HOLD_POSITION') {
+    if (waypoint) {
+      targetX = waypoint.x + sideSign * 2.4;
+      targetZ = waypoint.z;
+      actionTag = 'ANCHORING WAYPOINT';
+    } else {
+      targetX = x;
+      targetZ = z;
+      actionTag = 'HOLDING SECTOR';
+    }
+  } else {
+    // FOLLOW_SUPPORT: Flank leader in tactical V-wedge (or orbit combat target slightly)
+    const offsetAngle = leaderYaw + sideSign * 2.25;
+    targetX = leaderX + Math.sin(offsetAngle) * 4.2;
+    targetZ = leaderZ + Math.cos(offsetAngle) * 4.2;
+    if (nearestTerminal && Math.hypot(leaderX - nearestTerminal.x, leaderZ - nearestTerminal.z) <= 5.5) {
+      hackingTerminalId = nearestTerminal.id;
+      actionTag = `ASSIST HACK ${nearestTerminal.id}`;
+    }
+  }
+
+  // Clamp within basin safe boundary
+  const rad = Math.hypot(targetX, targetZ);
+  if (rad > 48) {
+    targetX = (targetX / rad) * 48;
+    targetZ = (targetZ / rad) * 48;
+  }
+
+  // 3. Determine Aim Direction & Weapon Fire
+  let aimYaw = leaderYaw;
+  let shouldFire = false;
+  let targetEnemyId: string | null = null;
+
+  if (nearestEnemy && nearestEnemy.dist <= 26) {
+    const dx = nearestEnemy.x - x;
+    const dz = nearestEnemy.z - z;
+    aimYaw = Math.atan2(-dx, -dz);
+    shouldFire = true;
+    targetEnemyId = nearestEnemy.id;
+    if (orderMode === 'FOLLOW_SUPPORT') {
+      actionTag = `SUPPRESSING ${nearestEnemy.id}`;
+    }
+  } else {
+    const moveDx = targetX - x;
+    const moveDz = targetZ - z;
+    if (Math.hypot(moveDx, moveDz) > 0.6) {
+      aimYaw = Math.atan2(-moveDx, -moveDz);
+    }
+  }
+
+  return {
+    targetX,
+    targetZ,
+    aimYaw,
+    targetEnemyId,
+    shouldFire,
+    hackingTerminalId,
+    actionTag,
+  };
+}
+
+

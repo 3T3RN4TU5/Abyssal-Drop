@@ -12,6 +12,8 @@ import {
   createInitialCircleState,
   advanceCircleClosure,
   isOutsideSafeCircle,
+  computeCompanionDecision,
+  getCompanionClasses,
   UnlockedSkillsMap,
   WeatherState,
 } from './rules';
@@ -147,4 +149,44 @@ test('advanceCircleClosure shrinks safe zone and transitions phases toward Extra
   assert.equal(c1.currentRadius, 36);
   assert.equal(c1.targetRadius, 25);
 });
+
+test('computeCompanionDecision engages nearby hostiles and executes BREACH_TERMINAL orders', () => {
+  const compClasses = getCompanionClasses('vanguard');
+  assert.deepEqual(compClasses, ['specter', 'warden']);
+
+  // 1. Follow & Support: should fire at nearby enemy within 26m
+  const escortDecision = computeCompanionDecision({
+    companionId: 'specter',
+    slotIndex: 0,
+    x: 0,
+    z: 20,
+    leaderX: 0,
+    leaderZ: 24,
+    leaderYaw: 0,
+    orderMode: 'FOLLOW_SUPPORT',
+    waypoint: null,
+    enemies: [{ id: 'E1', x: 0, z: 6, hp: 80 }],
+    terminals: [{ id: 'T1', x: -24, z: 14, hacked: false }],
+  });
+  assert.equal(escortDecision.shouldFire, true);
+  assert.equal(escortDecision.targetEnemyId, 'E1');
+
+  // 2. Breach Terminal: when close to an unhacked terminal, companion actively decrypts it
+  const breachDecision = computeCompanionDecision({
+    companionId: 'warden',
+    slotIndex: 1,
+    x: -23,
+    z: 14,
+    leaderX: 0,
+    leaderZ: 24,
+    leaderYaw: 0,
+    orderMode: 'BREACH_TERMINAL',
+    waypoint: null,
+    enemies: [],
+    terminals: [{ id: 'T1', x: -24, z: 14, hacked: false }],
+  });
+  assert.equal(breachDecision.hackingTerminalId, 'T1');
+  assert.equal(breachDecision.actionTag, 'DECRYPTING T1');
+});
+
 

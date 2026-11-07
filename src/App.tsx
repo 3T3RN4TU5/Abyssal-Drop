@@ -13,6 +13,7 @@ import {
   advanceWeatherSystem,
   CircleClosureState,
   CLASS_ABILITIES,
+  computeCompanionDecision,
   computeEffectiveStats,
   computeEffectiveWeatherMetrics,
   computeProbabilityHeatmap,
@@ -21,6 +22,7 @@ import {
   DropZoneOption,
   EnemyArchetype,
   GamePhase,
+  getCompanionClasses,
   HeatmapPoint,
   isOutsideSafeCircle,
   MissionModifier,
@@ -28,11 +30,15 @@ import {
   OperativeClassId,
   RoleMode,
   rollMissionModifiers,
+  SQUAD_ORDERS,
+  SquadOrderMode,
   UnlockedSkillsMap,
   WEATHER_CONFIGS,
   WeatherState,
 } from './game/rules';
 import {
+  animateEnemyCharacter,
+  animateOperativeCharacter,
   createAtmosphericSkyDome,
   createBasinGridTexture,
   createBasinNormalTexture,
@@ -177,6 +183,13 @@ export default function App() {
   const [isSkillTreeOpen, setIsSkillTreeOpen] = useState<boolean>(false);
   const [isStudioModalOpen, setIsStudioModalOpen] = useState<boolean>(false);
   const [hdrpMode, setHdrpMode] = useState<boolean>(true);
+  const [squadOrder, setSquadOrder] = useState<SquadOrderMode>('FOLLOW_SUPPORT');
+  const [companionTelemetry, setCompanionTelemetry] = useState<
+    Array<{ callsign: string; actionTag: string; color: string }>
+  >([
+    { callsign: 'WRAITH-2', actionTag: 'WEDGE OVERWATCH', color: '#06b6d4' },
+    { callsign: 'AEGIS-3', actionTag: 'WEDGE OVERWATCH', color: '#10b981' },
+  ]);
   const [circleState, setCircleState] = useState<CircleClosureState>(() =>
     createInitialCircleState()
   );
@@ -282,6 +295,7 @@ export default function App() {
     isSkillTreeOpen,
     isStudioModalOpen,
     hdrpMode,
+    squadOrder,
     circle: createInitialCircleState(),
     waypoint,
     dataCurrency,
@@ -309,8 +323,32 @@ export default function App() {
       muzzleTimer: 0,
     },
     squadMates: [
-      { id: 'specter' as OperativeClassId, callsign: 'WRAITH-2', x: -4, z: 30, yaw: 0, color: '#06b6d4' },
-      { id: 'warden' as OperativeClassId, callsign: 'AEGIS-3', x: 4, z: 30, yaw: 0, color: '#10b981' },
+      {
+        id: 'specter' as OperativeClassId,
+        callsign: 'WRAITH-2',
+        x: -4,
+        z: 30,
+        yaw: 0,
+        speed: 0,
+        shootCooldown: 0.4,
+        muzzleTimer: 0,
+        supportCooldown: 6.0,
+        actionTag: 'WEDGE OVERWATCH',
+        color: '#06b6d4',
+      },
+      {
+        id: 'warden' as OperativeClassId,
+        callsign: 'AEGIS-3',
+        x: 4,
+        z: 30,
+        yaw: 0,
+        speed: 0,
+        shootCooldown: 0.65,
+        muzzleTimer: 0,
+        supportCooldown: 8.0,
+        actionTag: 'WEDGE OVERWATCH',
+        color: '#10b981',
+      },
     ],
     operativeHistory: [{ x: 0, z: 28 }],
     kills: 0,
@@ -337,6 +375,7 @@ export default function App() {
     simRef.current.isSkillTreeOpen = isSkillTreeOpen;
     simRef.current.isStudioModalOpen = isStudioModalOpen;
     simRef.current.hdrpMode = hdrpMode;
+    simRef.current.squadOrder = squadOrder;
     simRef.current.waypoint = waypoint;
     simRef.current.dataCurrency = dataCurrency;
     simRef.current.skillPoints = skillPoints;
@@ -353,6 +392,7 @@ export default function App() {
     isSkillTreeOpen,
     isStudioModalOpen,
     hdrpMode,
+    squadOrder,
     waypoint,
     dataCurrency,
     skillPoints,
@@ -511,6 +551,14 @@ export default function App() {
 
   const handleSwitchOperativeClass = (nextClass: OperativeClassId) => {
     setActiveOperative(nextClass);
+    const compIds = getCompanionClasses(nextClass);
+    simRef.current.squadMates.forEach((sq, idx) => {
+      const cid = compIds[idx];
+      const prof = OPERATIVE_CLASSES[cid];
+      sq.id = cid;
+      sq.callsign = prof.callsign;
+      sq.color = prof.accentColor;
+    });
     const newStats = computeEffectiveStats(
       nextClass,
       unlockedSkills,
@@ -529,7 +577,26 @@ export default function App() {
     setStatusBanner(
       `Switched Lead Ground Operative to ${OPERATIVE_CLASSES[nextClass].callsign} (${OPERATIVE_CLASSES[nextClass].title})`
     );
+    sound.playDash();
   };
+
+  const handleCycleSquadOrder = useCallback((forcedMode?: SquadOrderMode) => {
+    const orderList: SquadOrderMode[] = [
+      'FOLLOW_SUPPORT',
+      'BREACH_TERMINAL',
+      'AGGRESSIVE_HUNT',
+      'HOLD_POSITION',
+    ];
+    setSquadOrder((prev) => {
+      const next =
+        forcedMode ?? orderList[(orderList.indexOf(prev) + 1) % orderList.length];
+      setStatusBanner(
+        `Squad Order Issued [C]: ${SQUAD_ORDERS[next].label} — ${SQUAD_ORDERS[next].description}`
+      );
+      sound.playAnalystPulse();
+      return next;
+    });
+  }, []);
 
   // Main Three.js WebGL initialization (mounted once)
   useEffect(() => {
@@ -1031,6 +1098,9 @@ export default function App() {
         e.preventDefault();
         setRoleMode((prev) => (prev === 'operative' ? 'analyst' : 'operative'));
         sound.playAnalystPulse();
+      } else if (e.code === 'KeyC') {
+        e.preventDefault();
+        handleCycleSquadOrder();
       } else if (e.code === 'KeyQ' && simRef.current.roleMode === 'operative') {
         simRef.current.classAbilityRequested = true;
       } else if (e.code === 'KeyW' && simRef.current.roleMode === 'analyst') {
@@ -1166,13 +1236,21 @@ export default function App() {
         s.splats = [];
       }
 
-      // Handle Operative Class Mesh Swap
+      // Handle Operative Class Mesh Swap (swaps Lead + rebuilds Companion Class Rigs)
       if (s.switchOperativeMeshRequested) {
         s.switchOperativeMeshRequested = false;
         scene.remove(playerMesh);
         playerMesh = createOperativeMesh(s.activeOperative, false);
         playerMesh.position.set(p.x, 0, p.z);
         scene.add(playerMesh);
+
+        squadMeshes.forEach((oldMesh, idx) => {
+          scene.remove(oldMesh);
+          const nextCompMesh = createOperativeMesh(s.squadMates[idx].id, true);
+          nextCompMesh.position.set(s.squadMates[idx].x, 0, s.squadMates[idx].z);
+          scene.add(nextCompMesh);
+          squadMeshes[idx] = nextCompMesh;
+        });
       }
 
       // Dynamic Weather Fog & Atmosphere interpolation
@@ -1219,15 +1297,22 @@ export default function App() {
         const core = t.mesh.userData.core as THREE.Mesh;
         if (core) {
           core.rotation.y += dt * (t.hacked ? 0.6 : 2.2);
-          core.position.y = 3.35 + Math.sin(now * 0.003) * 0.14;
+          core.position.y = 3.4 + Math.sin(now * 0.003) * 0.14;
         }
       });
 
-      // Title Screen Camera Tour
+      // Title Screen Camera Tour + Idle Character Breathing
       if (s.gamePhase === 'title') {
         const angle = now * 0.00025;
         camera.position.set(Math.sin(angle) * 44, 20, Math.cos(angle) * 44);
         camera.lookAt(0, 2, -6);
+        animateOperativeCharacter(playerMesh, 0, 0, now * 0.001, 0);
+        squadMeshes.forEach((sm, idx) =>
+          animateOperativeCharacter(sm, 0, 0, now * 0.001, idx * 1.7)
+        );
+        enemies.forEach((e, idx) =>
+          animateEnemyCharacter(e.mesh, 2.0, now * 0.001, idx * 1.1)
+        );
       } else if (
         s.gamePhase === 'playing' &&
         !s.isSkillTreeOpen &&
@@ -1383,8 +1468,11 @@ export default function App() {
           }
         }
 
+        const prevPx = p.x;
+        const prevPz = p.z;
         p.x = nextX;
         p.z = nextZ;
+        const playerActualSpeed = Math.hypot(p.x - prevPx, p.z - prevPz) / Math.max(0.001, simDt);
         playerMesh.position.set(p.x, 0, p.z);
 
         // Aim towards mouse world cursor (or movement direction)
@@ -1397,15 +1485,150 @@ export default function App() {
         }
         playerMesh.rotation.y = p.yaw;
 
-        // Squad Mates follow formation smoothly
+        // ====================================================================
+        // AUTONOMOUS COMPANION SQUAD AI (Combat Targeting, Firing, Terminal Breaching & Support Pulses)
+        // ====================================================================
+        const enemyInputs = enemies.map((e) => ({
+          id: e.id,
+          x: e.x,
+          z: e.z,
+          hp: e.hp,
+        }));
+        const termInputs = terminals.map((t) => ({
+          id: t.id,
+          x: t.x,
+          z: t.z,
+          hacked: t.hacked,
+        }));
+
         s.squadMates.forEach((sq, idx) => {
-          const offsetAngle = p.yaw + (idx === 0 ? 2.3 : -2.3);
-          const targetSqX = p.x + Math.sin(offsetAngle) * 4.2;
-          const targetSqZ = p.z + Math.cos(offsetAngle) * 4.2;
-          sq.x = THREE.MathUtils.damp(sq.x, targetSqX, 4.5, simDt);
-          sq.z = THREE.MathUtils.damp(sq.z, targetSqZ, 4.5, simDt);
+          const decision = computeCompanionDecision({
+            companionId: sq.id,
+            slotIndex: (idx as 0 | 1),
+            x: sq.x,
+            z: sq.z,
+            leaderX: p.x,
+            leaderZ: p.z,
+            leaderYaw: p.yaw,
+            orderMode: s.squadOrder,
+            waypoint: s.waypoint,
+            enemies: enemyInputs,
+            terminals: termInputs,
+          });
+
+          sq.actionTag = decision.actionTag;
+          const prevSqX = sq.x;
+          const prevSqZ = sq.z;
+
+          // Move companion smoothly toward target coordinates (faster when sprinting to terminals/enemies)
+          const compMoveSpeed =
+            s.squadOrder === 'BREACH_TERMINAL' || s.squadOrder === 'AGGRESSIVE_HUNT'
+              ? 8.8
+              : 7.4;
+          const dxSq = decision.targetX - sq.x;
+          const dzSq = decision.targetZ - sq.z;
+          const distToTarget = Math.hypot(dxSq, dzSq);
+          if (distToTarget > 0.25) {
+            const step = Math.min(distToTarget, compMoveSpeed * simDt);
+            let nextSqX = sq.x + (dxSq / distToTarget) * step;
+            let nextSqZ = sq.z + (dzSq / distToTarget) * step;
+            for (const cov of coverObstacles) {
+              if (
+                Math.abs(nextSqX - cov.x) < cov.rx + 0.65 &&
+                Math.abs(nextSqZ - cov.z) < cov.rz + 0.65
+              ) {
+                if (Math.abs(sq.x - cov.x) >= cov.rx + 0.6) nextSqX = sq.x;
+                if (Math.abs(sq.z - cov.z) >= cov.rz + 0.6) nextSqZ = sq.z;
+              }
+            }
+            sq.x = nextSqX;
+            sq.z = nextSqZ;
+          }
+
+          sq.speed = Math.hypot(sq.x - prevSqX, sq.z - prevSqZ) / Math.max(0.001, simDt);
+          sq.yaw = decision.aimYaw;
           squadMeshes[idx].position.set(sq.x, 0, sq.z);
-          squadMeshes[idx].rotation.y = p.yaw;
+          squadMeshes[idx].rotation.y = sq.yaw;
+
+          // Companion Autonomous Weapon Fire
+          sq.shootCooldown = Math.max(0, sq.shootCooldown - simDt);
+          sq.muzzleTimer = Math.max(0, sq.muzzleTimer - dt);
+          if (decision.shouldFire && sq.shootCooldown <= 0) {
+            sq.shootCooldown = sq.id === 'warden' ? 0.34 : sq.id === 'specter' ? 0.58 : 0.42;
+            sq.muzzleTimer = 0.07;
+            const fireDirX = -Math.sin(sq.yaw);
+            const fireDirZ = -Math.cos(sq.yaw);
+            const compDmg = sq.id === 'specter' ? 22 : sq.id === 'warden' ? 16 : 18;
+            spawnBullet(
+              sq.x + fireDirX * 1.1,
+              sq.z + fireDirZ * 1.1,
+              fireDirX,
+              fireDirZ,
+              false,
+              compDmg
+            );
+          }
+
+          // Companion Autonomous Terminal Decryption
+          if (decision.hackingTerminalId) {
+            const compTerm = terminals.find(
+              (t) => t.id === decision.hackingTerminalId && !t.hacked
+            );
+            if (compTerm) {
+              compTerm.progress = Math.min(1, compTerm.progress + (simDt * 0.65) / 2.8);
+              if (compTerm.progress >= 1 && !compTerm.hacked) {
+                compTerm.hacked = true;
+                const { holoMat, ringMat } = compTerm.mesh.userData;
+                holoMat.color.setHex(0x10b981);
+                holoMat.emissive.setHex(0x10b981);
+                ringMat.color.setHex(0x10b981);
+
+                const totalDataEarned = Math.round(35 * s.effectiveStats.dataYieldMultiplier);
+                setDataCurrency((d) => d + totalDataEarned);
+                setRunStats((rs) => ({
+                  ...rs,
+                  dataExtracted: rs.dataExtracted + totalDataEarned,
+                  terminalsBreached: rs.terminalsBreached + 1,
+                }));
+                const hackedNow = terminals.filter((t) => t.hacked).length;
+                setTerminalsHacked(hackedNow);
+                if (hackedNow >= 2) setExtractionReady(true);
+                sound.playHackComplete();
+                awardXpAndCheckLevel(65, `${sq.callsign} Breached ${compTerm.label}`);
+                setStatusBanner(
+                  `${sq.callsign} Decrypted ${compTerm.label}! +${totalDataEarned} GB Uploaded`
+                );
+              }
+            }
+          }
+
+          // Companion Autonomous Class Support Pulse (every ~9s)
+          sq.supportCooldown = Math.max(0, sq.supportCooldown - simDt);
+          if (sq.supportCooldown <= 0) {
+            sq.supportCooldown = 9.0 + idx * 2.5;
+            if (sq.id === 'specter') {
+              // WRAITH-2: Thermoptic Recon Ping decloaks nearby enemies
+              enemies.forEach((e) => {
+                if (e.hp > 0 && Math.hypot(e.x - sq.x, e.z - sq.z) <= 24) {
+                  e.revealedTimer = Math.max(e.revealedTimer, 6.0);
+                }
+              });
+            } else if (sq.id === 'warden') {
+              // AEGIS-3: Nano-Field restores +8 HP to Lead Operative if damaged
+              if (p.hp > 0 && p.hp < p.maxHp) {
+                p.hp = Math.min(p.maxHp, p.hp + 8);
+              }
+            }
+          }
+
+          // Animate Companion Character Limbs, Breathing & Weapon Recoil
+          animateOperativeCharacter(
+            squadMeshes[idx],
+            sq.speed,
+            sq.muzzleTimer,
+            now * 0.001,
+            (idx + 1) * 1.9
+          );
         });
 
         // Record Operative historical movement for AI Faction route-cutting
@@ -1427,11 +1650,13 @@ export default function App() {
 
         p.shootCooldown = Math.max(0, p.shootCooldown - simDt);
         p.muzzleTimer = Math.max(0, p.muzzleTimer - dt);
-        const muzzleObj = playerMesh.getObjectByName('muzzleFlash') as THREE.Mesh | undefined;
-        if (muzzleObj) {
-          (muzzleObj.material as THREE.MeshBasicMaterial).opacity =
-            p.muzzleTimer > 0 ? 0.92 : 0.0;
-        }
+        animateOperativeCharacter(
+          playerMesh,
+          playerActualSpeed,
+          p.muzzleTimer,
+          now * 0.001,
+          0
+        );
         muzzlePointLight.position.set(
           p.x - Math.sin(p.yaw) * 1.15,
           1.45,
@@ -1614,6 +1839,12 @@ export default function App() {
           e.z = THREE.MathUtils.clamp(e.z + e.vz * simDt, -48, 48);
           e.mesh.position.set(e.x, 0, e.z);
           e.mesh.rotation.y = Math.atan2(p.x - e.x, p.z - e.z);
+          animateEnemyCharacter(
+            e.mesh,
+            Math.hypot(e.vx, e.vz),
+            now * 0.001,
+            Number(e.id.slice(1)) * 1.3
+          );
 
           // Acoustic Footstep Ink Splatters (modulated by Weather audio propagation)
           const audioRange = 26 * s.effectiveWeather.config.audioPropagationMultiplier;
@@ -1786,6 +2017,13 @@ export default function App() {
           );
           setExtractionProgress(Math.round(s.extractionProgress * 100));
           setInkSplats([...s.splats]);
+          setCompanionTelemetry(
+            s.squadMates.map((sq) => ({
+              callsign: sq.callsign,
+              actionTag: sq.actionTag,
+              color: sq.color,
+            }))
+          );
 
           if (s.roleMode === 'analyst') {
             const simHorizon = 4.0 * s.effectiveStats.analystSimHorizonMultiplier;
@@ -2207,36 +2445,77 @@ export default function App() {
 
           {/* Bottom Row (Operative Mode): Squad Switcher & Weapon/Ability Telemetry */}
           {roleMode === 'operative' && (
-            <div className="flex flex-wrap items-end justify-between gap-4">
-              {/* Squad Operative Switcher */}
-              <div className="ink-panel rounded-xl p-2.5 pointer-events-auto flex items-center gap-2">
-                {(['vanguard', 'specter', 'warden'] as OperativeClassId[]).map((cid) => {
-                  const op = OPERATIVE_CLASSES[cid];
-                  const isCurr = activeOperative === cid;
-                  return (
-                    <button
-                      key={cid}
-                      type="button"
-                      onClick={() => handleSwitchOperativeClass(cid)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                        isCurr
-                          ? 'bg-cyan-500 text-slate-950'
-                          : 'bg-slate-900 text-slate-300 hover:text-white'
-                      }`}
-                    >
-                      {op.callsign}
-                    </button>
-                  );
-                })}
+            <div className="flex items-end justify-between gap-3">
+              {/* Squad Operative Switcher & Tactical Companion Orders ([C]) */}
+              <div className="ink-panel rounded-xl p-2.5 pointer-events-auto flex flex-col gap-1.5 shrink-0">
+                <div className="flex items-center justify-between gap-2 px-0.5">
+                  <span className="text-[10px] font-mono-tabular uppercase text-slate-400">
+                    Orders [C]:
+                  </span>
+                  <div className="flex items-center gap-1">
+                    {(
+                      [
+                        'FOLLOW_SUPPORT',
+                        'BREACH_TERMINAL',
+                        'AGGRESSIVE_HUNT',
+                        'HOLD_POSITION',
+                      ] as SquadOrderMode[]
+                    ).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => handleCycleSquadOrder(mode)}
+                        className={`px-2 py-0.5 rounded text-[10px] font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                          squadOrder === mode
+                            ? 'bg-amber-400 text-slate-950'
+                            : 'bg-slate-900 text-slate-300 hover:text-white border border-slate-800'
+                        }`}
+                      >
+                        {SQUAD_ORDERS[mode].shortLabel}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    {(['vanguard', 'specter', 'warden'] as OperativeClassId[]).map((cid) => {
+                      const op = OPERATIVE_CLASSES[cid];
+                      const isCurr = activeOperative === cid;
+                      return (
+                        <button
+                          key={cid}
+                          type="button"
+                          onClick={() => handleSwitchOperativeClass(cid)}
+                          className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                            isCurr
+                              ? 'bg-cyan-500 text-slate-950'
+                              : 'bg-slate-900 text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          {op.callsign}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="hidden sm:flex items-center gap-2 text-[10px] font-mono-tabular pl-2 border-l border-slate-800">
+                    {companionTelemetry.map((ct) => (
+                      <span key={ct.callsign} className="text-slate-300 whitespace-nowrap">
+                        <strong style={{ color: ct.color }}>{ct.callsign}:</strong>{' '}
+                        {ct.actionTag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
               </div>
 
               {/* Status Banner */}
-              <div className="hidden lg:block text-xs font-mono-tabular text-slate-300 bg-slate-950/85 border border-slate-800 px-3.5 py-2 rounded-lg">
+              <div className="hidden xl:block max-w-xs truncate text-xs font-mono-tabular text-slate-300 bg-slate-950/85 border border-slate-800 px-3 py-2 rounded-lg">
                 {statusBanner}
               </div>
 
               {/* Weapon & Dash Telemetry Cluster */}
-              <div className="ink-panel rounded-xl p-3.5 pointer-events-auto flex items-center gap-5">
+              <div className="ink-panel rounded-xl p-3.5 pointer-events-auto flex items-center gap-5 shrink-0">
                 <div>
                   <div className="text-[10px] font-mono-tabular uppercase text-slate-400">
                     Pulse Carbine · DMG {effectiveStats.weaponDamage}
